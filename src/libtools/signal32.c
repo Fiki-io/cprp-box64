@@ -215,6 +215,9 @@ typedef struct
   } i386_mcontext_t;
 
 // /!\ signal sig_set is different than glibc __sig_set
+#ifdef _NSIG_WORDS
+#undef _NSIG_WORDS
+#endif
 #define _NSIG_WORDS (64 / 32)
 typedef unsigned long i386_old_sigset_t;
 typedef struct {
@@ -279,6 +282,13 @@ typedef union my_sigval32
   int sival_int;
   ptr_t sival_ptr;
 } my_sigval32_t;
+
+#ifndef __SI_SIGFAULT_ADDL
+#define __SI_SIGFAULT_ADDL
+#endif
+#ifdef si_tid
+#undef si_tid
+#endif
 
 typedef struct __attribute__((packed, aligned(4))) my_siginfo32_s
 {
