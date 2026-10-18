@@ -7,7 +7,9 @@
 #include <sys/epoll.h>
 #include <fts.h>
 #include <sys/socket.h>
+#ifndef ANDROID
 #include <obstack.h>
+#endif
 
 #include "x64emu.h"
 #include "emu/x64emu_private.h"
@@ -1467,6 +1469,7 @@ void convert_regext_to_64(void* d, void* s)
     dst->flags = src->flags;
 }
 
+#ifndef ANDROID
 void* inplace_obstack_chunk_shrink(void* a)
 {
     if(a) {
@@ -1542,3 +1545,4 @@ void convert_obstack_to_64(void* d, void* s)
         chunk = prev;
     }
 }
+#endif
