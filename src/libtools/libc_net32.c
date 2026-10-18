@@ -361,7 +361,13 @@ EXPORT int my32_getservbyname_r(x64emu_t* emu, void* name, void* proto, struct i
 {
     struct servent ret_l = {0};
     struct servent *result_l = NULL;
+#ifndef ANDROID
     int r = getservbyname_r(name, proto, &ret_l, buff, buflen, &result_l);
+#else
+    (void)ret_l; (void)buff; (void)buflen;
+    result_l = getservbyname(name, proto);
+    int r = result_l ? 0 : ENOENT;
+#endif
     if(!result_l) {
         *result = 0;
         return r;
@@ -486,7 +492,13 @@ EXPORT int my32_getprotobyname_r(x64emu_t* emu, void* name,struct protoent_32* r
 {
     struct protoent ret_l = {0};
     struct protoent *result_l = NULL;
+#ifndef ANDROID
     int r = getprotobyname_r(name, &ret_l, buff, buflen, &result_l);
+#else
+    (void)ret_l; (void)buff; (void)buflen;
+    result_l = getprotobyname(name);
+    int r = result_l ? 0 : ENOENT;
+#endif
     if(!result_l)
         *result = 0;
     else
@@ -514,7 +526,13 @@ EXPORT int my32_getprotobynumber_r(x64emu_t* emu, int proto,struct protoent_32* 
 {
     struct protoent ret_l = {0};
     struct protoent *result_l = NULL;
+#ifndef ANDROID
     int r = getprotobynumber_r(proto, &ret_l, buff, buflen, &result_l);
+#else
+    (void)ret_l; (void)buff; (void)buflen;
+    result_l = getprotobynumber(proto);
+    int r = result_l ? 0 : ENOENT;
+#endif
     if(!result_l)
         *result = 0;
     else
