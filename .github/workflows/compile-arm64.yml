@@ -35,7 +35,7 @@ jobs:
             -DANDROID=ON \
             -DARM64=ON \
             -DARM_DYNAREC=ON \
-            -DBOX32=OFF \
+            -DBOX32=ON \
             -DNOLOADADDR=ON \
             -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
