@@ -703,10 +703,14 @@ EXPORT int my32_pthread_getattr_np(x64emu_t* emu, uintptr_t th, void* attr)
 		//printf_log(LOG_INFO, "pthread_getattr_np called for self, stack=%p, sz=%lx\n", stack, sz);
         if (!sz) {
             // get default stack size
+            #ifndef ANDROID
             pthread_attr_t attr;
             pthread_getattr_default_np(&attr);
             pthread_attr_getstacksize(&attr, &sz);
             pthread_attr_destroy(&attr);
+            #else
+            sz = 2*1024*1024;
+            #endif
             // should stack be adjusted?
         }
         AddStackSize((uintptr_t)attr, stack, sz);
@@ -1057,7 +1061,14 @@ EXPORT int my32_pthread_mutex_init(pthread_mutex_t *m, pthread_mutexattr_t *att)
     fake->__kind = KIND_SIGN;
     fake->real_mutex = to_ptrv(createNewMutex());
     int ret = pthread_mutex_init(from_ptrv(fake->real_mutex), att);
+#ifndef ANDROID
     fake->i386__kind = ((struct __pthread_mutex_s*)from_ptrv(fake->real_mutex))->__kind;
+#else
+    fake->i386__kind = 0;
+    if (att) {
+        pthread_mutexattr_gettype(att, &fake->i386__kind);
+    }
+#endif
     printf_log(LOG_DEBUG, "(init t%d %p) ", fake->i386__kind, from_ptrv(fake->real_mutex));
     return ret;
 }
