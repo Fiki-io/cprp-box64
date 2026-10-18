@@ -2,6 +2,7 @@
 #ifndef __DEBUG_H_
 #define __DEBUG_H_
 #include <stdint.h>
+#include <string.h>
 #include <env.h>
 
 #include "os.h"
