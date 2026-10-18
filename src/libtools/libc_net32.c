@@ -579,6 +579,7 @@ typedef struct my_res_state_32_s {
 	} _u;
 } my_res_state_32_t;
 
+#ifndef ANDROID
 void* convert_res_state_to_32(void* d, void* s)
 {
     if(!d || !s) return NULL;
@@ -680,6 +681,13 @@ EXPORT int my32_res_search(x64emu_t* emu, void* dname, int class, int type, void
     emu->libc_herr = h_errno;
     return ret;
 }
+#else
+void* convert_res_state_to_32(void* d, void* s) { (void)s; return d; }
+void* convert_res_state_to_64(void* d, void* s) { (void)s; return d; }
+EXPORT void* my32___res_state(x64emu_t* emu) { (void)emu; return NULL; }
+EXPORT int my32_res_query(x64emu_t* emu, void* dname, int class, int type, void* answer, int anslen) { (void)emu; (void)dname; (void)class; (void)type; (void)answer; (void)anslen; return -1; }
+EXPORT int my32_res_search(x64emu_t* emu, void* dname, int class, int type, void* answer, int anslen) { (void)emu; (void)dname; (void)class; (void)type; (void)answer; (void)anslen; return -1; }
+#endif
 
 void convert_ns_msg_to_32(void* d, void* s)
 {
