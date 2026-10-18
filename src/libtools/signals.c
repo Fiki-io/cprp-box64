@@ -90,7 +90,11 @@ uint64_t RunFunctionHandler(x64emu_t* emu, int* exit, int dynarec, x64_ucontext_
         va_end (va);
         printf_log(LOG_NONE, "%04d|Warning, calling Signal %d function handler %s\n", GetTID(), sig, fnc?"SIG_IGN":"SIG_DFL");
         if(fnc==0) {
-            printf_log(LOG_NONE, "Unhandled signal caught, dying with the signal\n");
+            printf_log(LOG_NONE, "Unhandled signal %d caught, terminating execution gracefully\n", sig);
+#if defined(ANDROID) || defined(BOX64LIB)
+            fprintf(stderr, "[BOX64] Sinyal fatal %d tertangkap. Menghentikan emulasi secara aman.\n", sig);
+            exit(128 + sig);
+#else
             // restore the default handler for this signal, unblock it and re-raise it, 
             // so the process dies with the expected signal (e.g. SIGSEGV) instead of aborting with SIGABRT.
             struct sigaction sa;
@@ -105,6 +109,7 @@ uint64_t RunFunctionHandler(x64emu_t* emu, int* exit, int dynarec, x64_ucontext_
             raise(sig);
             // should not reach here
             abort();
+#endif
         }
         return 0;
     }

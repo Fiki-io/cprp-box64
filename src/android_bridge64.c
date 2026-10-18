@@ -90,7 +90,16 @@ __attribute__((visibility("default"), noreturn)) void _Exit(int status) {
     if (s_in_runner) {
         longjmp(s_exit_jmp, status == 0 ? 10000 : status);
     }
-    abort();
+    exit(status);
+}
+
+__attribute__((visibility("default"), noreturn)) void abort(void) {
+    LOGE("abort() intercepted in CPRP native bridge");
+    fprintf(stderr, "[BOX64] abort() terpanggil. Menghentikan emulasi secara aman.\n");
+    if (s_in_runner) {
+        longjmp(s_exit_jmp, 134);
+    }
+    _Exit(134);
 }
 
 __attribute__((visibility("default"))) int execvp(const char* file, char* const argv[]) {
@@ -105,6 +114,17 @@ __attribute__((visibility("default"))) int execve(const char* pathname, char* co
     fprintf(stderr, "[BOX64] Error: '%s' execve diblokir di lingkungan Android.\n", pathname ? pathname : "null");
     errno = ENOEXEC;
     return -1;
+}
+
+static void cprp_bridge_signal_handler(int sig, siginfo_t* info, void* ucontext) {
+    (void)ucontext;
+    void* fault_addr = info ? info->si_addr : NULL;
+    LOGE("Fatal signal %d trapped in CPRP bridge at %p", sig, fault_addr);
+    fprintf(stderr, "\n[BOX64] Sinyal fatal %d tertangkap pada alamat %p. Menghentikan emulasi secara aman.\n", sig, fault_addr);
+    if (s_in_runner) {
+        longjmp(s_exit_jmp, 128 + sig);
+    }
+    _Exit(128 + sig);
 }
 
 static int run_core_internal(JNIEnv* env, jobjectArray argsArray) {
@@ -123,6 +143,15 @@ static int run_core_internal(JNIEnv* env, jobjectArray argsArray) {
         LOGI("arg[%d] = %s", i, argv[i]);
     }
 
+    struct sigaction sa_new, sa_old_segv, sa_old_bus, sa_old_ill, sa_old_abrt;
+    memset(&sa_new, 0, sizeof(sa_new));
+    sa_new.sa_sigaction = cprp_bridge_signal_handler;
+    sa_new.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGSEGV, &sa_new, &sa_old_segv);
+    sigaction(SIGBUS, &sa_new, &sa_old_bus);
+    sigaction(SIGILL, &sa_new, &sa_old_ill);
+    sigaction(SIGABRT, &sa_new, &sa_old_abrt);
+
     s_in_runner = 1;
     int jmp_res = setjmp(s_exit_jmp);
     int result = 0;
@@ -130,9 +159,14 @@ static int run_core_internal(JNIEnv* env, jobjectArray argsArray) {
         result = box64_main(argc, argv, NULL);
     } else {
         result = (jmp_res == 10000) ? 0 : jmp_res;
-        LOGI("box64_main unwound via intercepted exit with code: %d", result);
+        LOGI("box64_main unwound via intercepted exit/signal with code: %d", result);
     }
     s_in_runner = 0;
+
+    sigaction(SIGSEGV, &sa_old_segv, NULL);
+    sigaction(SIGBUS, &sa_old_bus, NULL);
+    sigaction(SIGILL, &sa_old_ill, NULL);
+    sigaction(SIGABRT, &sa_old_abrt, NULL);
 
     fflush(stdout);
     fflush(stderr);
