@@ -117,7 +117,10 @@ void init_malloc_hook(void);
 #define box_calloc      calloc
 #define box_free        free
 #define box_memalign    memalign
-#define box_strdup      strdup
+static inline char* box_strdup_safe(const char* s) {
+    return s ? strdup(s) : NULL;
+}
+#define box_strdup      box_strdup_safe
 #define box_realpath    realpath
 #else
 extern size_t (*box_malloc_usable_size)(void*);

@@ -1060,6 +1060,8 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
         AddPath("libwayland-client.so.0", &my_context->box64_emulated_libs, 0);
 
     my_context->box64path = ResolveFile(argv[0], &my_context->box64_path);
+    if (!my_context->box64path)
+        my_context->box64path = box_strdup(argv[0]);
     // prepare all other env. var
     my_context->envc = CountEnv(environ?environ:env);
     printf_log(LOG_INFO, "Counted %d Env var\n", my_context->envc);
@@ -1125,9 +1127,9 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
     }
     // check if box86 is present
     {
-        my_context->box86path = box_strdup(my_context->box64path);
+        my_context->box86path = my_context->box64path ? box_strdup(my_context->box64path) : NULL;
         #ifndef BOX32
-        if(strstr(my_context->box86path, "box64")) {
+        if(my_context->box86path && strstr(my_context->box86path, "box64")) {
             char* p = strrchr(my_context->box86path, '6');  // get the 6 of box64
             p[0] = '8'; p[1] = '6'; // change 64 to 86
         } else {
