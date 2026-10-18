@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: MIT
+#ifndef __DYNAREC_RV64_PRIVATE_H_
+#define __DYNAREC_RV64_PRIVATE_H_
+#include <stdint.h>
+
+#include "../dynarec_private.h"
+
+typedef struct x64emu_s x64emu_t;
+typedef struct dynablock_s dynablock_t;
+typedef struct instsize_s instsize_t;
+typedef struct box64env_s box64env_t;
+
+#define BARRIER_MAYBE   8
+
+#define EXT_CACHE_NONE   0
+#define EXT_CACHE_ST_D   1
+#define EXT_CACHE_ST_F   2
+#define EXT_CACHE_ST_I64 3
+#define EXT_CACHE_MM     4
+#define EXT_CACHE_SS     5
+#define EXT_CACHE_SD     6
+#define EXT_CACHE_SCR    7
+#define EXT_CACHE_XMMW   8
+#define EXT_CACHE_XMMR   9
+#define EXT_CACHE_MMV    10
+#define EXT_CACHE_YMMW   11
+#define EXT_CACHE_YMMR   12
+
+#define EXT_CACHE_OLD_SD   0
+#define EXT_CACHE_OLD_SS   1
+#define EXT_CACHE_OLD_XMMW 2
+#define EXT_CACHE_OLD_XMMR 3
+
+typedef union ext_cache_s {
+    int16_t v;
+    struct {
+        uint16_t t : 4; // reg type
+        uint16_t n : 4; // reg number
+        uint16_t y : 1; // register holds the whole ymm
+    };
+} ext_cache_t;
+
+typedef union mmx_cache_s {
+    int8_t v;
+    struct {
+        uint8_t reg : 7;
+        uint8_t vector : 1;
+    };
+} mmx_cache_t;
+
+typedef union sse_cache_s {
+    int32_t v;
+    struct {
+        uint32_t reg : 13;
+        uint32_t vector : 1;
+        uint32_t single : 1;
+        uint32_t write : 1;
+        uint32_t ymm : 1;  // register holds the whole ymm
+        uint32_t ymm0 : 1; // architectural upper half of the ymm is zero
+    };
+} sse_cache_t;
+
+typedef union sse_old_s {
+    int8_t      v;
+    struct {
+        uint8_t     changed:1;
+        uint8_t     purged:1;
+        uint8_t     reg:4;
+        uint8_t     type:2;
+    };
+} sse_old_t;
+
+typedef struct extcache_s {
+    // ext cache
+    ext_cache_t         extcache[32];
+    int8_t              stack;
+    int8_t              stack_next;
+    int8_t              stack_pop;
+    int8_t              stack_push;
+    uint8_t             combined1;
+    uint8_t             combined2;
+    uint8_t             swapped;        // the combined reg were swapped
+    uint8_t             barrier;        // is there a barrier at instruction epilog?
+    uint8_t             pushed;         // positive pushed value (to check for overflow)
+    uint8_t             poped;          // positive poped value (to check for underflow)
+    uint32_t            news;           // bitmask, wich neoncache are new for this opcode
+    sse_old_t           olds[16];       // SSE regs has changed or has been removed
+    // fpu cache
+    int8_t              x87cache[8];    // cache status for the 8 x87 register behind the fpu stack
+    int8_t              x87reg[8];      // reg used for x87cache entry
+    int16_t             tags;           // similar to fpu_tags
+    mmx_cache_t         mmxcache[8];    // cache status for the 8 MMX registers
+    sse_cache_t         ssecache[16];   // cache status for the 16 SSE(2) registers
+    int8_t              fpuused[32];    // all double reg from fpu, used by x87, mmx, sse and avx
+    int8_t              x87stack;       // cache stack counter
+    int8_t              mmxcount;       // number of mmx register used (not both mmx and x87 at the same time)
+    int8_t              fpu_scratch;    // scratch counter
+    uint16_t ymm0;                      // upper 128bits are zero and not held in memory
+} extcache_t;
+
+typedef enum flagcache_s {
+    status_unk = 0,      // unknown deferred flags status
+    status_set,          // deferred flags set to something (not 0)
+    status_none_pending, // deferred flags set to 0, but still pending the write to x64emu_t
+    status_none,         // deferred flags set to 0, written to x64emu_t
+} flagcache_t;
+
+typedef struct callret_s callret_t;
+
+#define RSP_CLASS_BARRIER 0
+#define RSP_CLASS_PUSH    1
+#define RSP_CLASS_POP     2
+
+typedef struct instruction_rv64_s {
+    instruction_x64_t   x64;
+    uintptr_t           address;    // (start) address of the riscv emitted instruction
+    uintptr_t           epilog;     // epilog of current instruction (can be start of next, or barrier stuff)
+    int                 size;       // size of the riscv emitted instruction
+    int                 size2;      // size of the riscv emitted instruction after pass2
+    int                 pred_sz;    // size of predecessor list
+    int                 *pred;      // predecessor array
+    uintptr_t           mark[4];
+    uintptr_t           markf[2];
+    uintptr_t           markfnan;
+    uintptr_t           markseg;
+    uintptr_t           marklock;
+    uintptr_t           marklock2;
+    int                 pass2choice;// value for choices that are fixed on pass2 for pass3
+    uintptr_t           natcall;
+    uint16_t            retn;
+    uint16_t            ymm0_pass2, ymm0_pass3;
+    int                 barrier_maybe;
+    uint8_t             will_write:2;    // [strongmem] will write to memory
+    uint8_t             will_read:1;     // [strongmem] will read from memory
+    uint8_t             last_write:1;    // [strongmem] the last write in a SEQ
+    uint8_t             lock:1;          // [strongmem] lock semantic
+    uint8_t             df_needed:1;
+    uint8_t             df_notneeded:1;
+    uint8_t             nat_flags_fusion:1;
+    uint8_t             nat_flags_nofusion:1;
+    uint8_t             nat_flags_carry:1;
+    uint8_t             nat_flags_sign:1;
+    uint8_t             nat_flags_needsign:1;
+    uint8_t             unaligned:1;    // this opcode can be re-generated for unaligned special case
+    uint8_t             x87precision:1; // this opcode can handle x87pc
+    uint8_t             no_scratch_usage:1; // this opcode does not use scratch register
+    uint8_t             nat_flags_op1;
+    uint8_t             nat_flags_op2;
+    uint16_t            nat_next_inst;
+    flagcache_t         f_exit;     // flags status at end of instruction
+    extcache_t          e;          // extcache at end of instruction (but before poping)
+    flagcache_t         f_entry;    // flags status before the instruction begin
+    uint8_t             vector_sew_entry; // sew status before the instruction begin
+    uint8_t             vector_sew_exit;  // sew status at the end of instruction
+    int16_t             rsp_entry;        // pending rsp offset at entry
+    int16_t             rsp_flush;        // rsp offset to emit right after this push/pop
+    uint8_t             rsp_merge:1;      // this push/pop is emitted with merged rsp offset
+    uint8_t             rsp_class:2;      // RSP_* of this opcode (marked by the opcode handler)
+    uint8_t             rsp_span;         // push/pop depth of this opcode in bytes (0 = one delta, PUSHA/POPA = 32)
+    uint16_t            up32_read;        // bitmask of GPRs whose upper 32 bits are read by this instruction
+    uint16_t            up32_write64;     // bitmask of GPRs written as 64-bit by this instruction (upper 32 become defined)
+    uint16_t            up32_write32;     // bitmask of GPRs written as 32-bit by this instruction
+    uint16_t            up32_zero;        // bitmask of GPRs guaranteed to be zero-extended at instruction exit
+    uint16_t            up32_skip;        // bitmask of GPRs where the implicit zero-up after a 32-bit write can be skipped
+    uint16_t            up32_pending;     // bitmask of GPRs whose upper 32 bits are stale at entry to this instruction
+    uint16_t            ymm_upper_use;    // bitmask of YMM upper halves read by this instruction
+    uint16_t            ymm_upper_def;    // bitmask of YMM upper halves written by this instruction
+    uint16_t            ymm_upper_live;   // bitmask of YMM upper halves live after this instruction
+    uint16_t            ymm_zero;         // bitmask of YMM upper halves deferred-zeroed by this instruction
+    uint16_t            ymm_pending;      // bitmask of pending YMM upper-half zeros on entry to this instruction
+} instruction_rv64_t;
+
+typedef struct dynarec_rv64_s {
+    instruction_rv64_t* insts;
+    int32_t             size;
+    int32_t             cap;
+    uintptr_t           start;      // start of the block
+    uintptr_t           end;        // maximum end of the block (only used in pass0)
+    uint32_t            isize;      // size in byte of x64 instructions included
+    uint32_t            prefixsize; // size in byte of the prefix of the block
+    void*               block;      // memory pointer where next instruction is emitted
+    uintptr_t           native_start;  // start of the riscv code
+    size_t              native_size;   // size of emitted riscv code
+    uintptr_t           last_ip;    // last set IP in RIP (or NULL if unclean state) TODO: move to a cache something
+    uint64_t*           table64;   // table of 64bits value
+    int                 table64size;// size of table (will be appended at end of executable code)
+    int                 table64cap;
+    uintptr_t           tablestart;
+    uintptr_t           jmp_next;   // address of the jump_next address
+    flagcache_t         f;
+    extcache_t          e;          // cache for the 10..31 0..1 double reg from fpu, plus x87 stack delta
+    uintptr_t*          next;       // variable array of "next" jump address
+    int                 next_sz;
+    int                 next_cap;
+    int*                jmps;       // variable array of jump instructions
+    int                 jmp_sz;
+    int                 jmp_cap;
+    int                 peeking_flags;
+    int*                predecessor;// single array of all predecessor
+    dynablock_t*        dynablock;
+    instsize_t*         instsize;
+    size_t              insts_size; // size of the instruction size array (calculated)
+    int                 callret_size;   // size of the array
+    callret_t*          callrets;   // array of callret return, with NOP / UDF depending if the block is clean or dirty
+    uint8_t             smwrite;    // for strongmem model emulation
+    uintptr_t           forward;    // address of the last end of code while testing forward
+    uintptr_t           forward_to; // address of the next jump to (to check if everything is ok)
+    int32_t             forward_size;   // size at the forward point
+    int                 forward_ninst;  // ninst at the forward point
+    uint16_t            ymm_zero;   // bitmap of ymm to zero at purge
+    uint8_t             always_test;
+    uint8_t             abort;
+    uint8_t             vector_sew;     // current sew status
+    uint8_t             vector_eew;     // current effective sew status, should only be used after SET_ELEMENT_WIDTH
+    uint8_t             inst_sew;       // sew inside current instruction, for vsetvli elimination
+    uint8_t             inst_vl;        // vl inside current instruction, for vsetvli elimination
+    uint8_t             inst_vlmul;     // vlmul inside current instruction
+    uint8_t             is_file_mapped; // if the memory is a mapped file (probably binary, not a memory)
+    void*               gdbjit_block;
+    uint32_t            need_x87check; // x87 low precision check
+    uint32_t            need_dump;     // need to dump the block
+    int                 need_reloc; // does the dynablock need relocations
+    int                 reloc_size;
+    uint32_t*           relocs;
+    box64env_t*         env;
+} dynarec_rv64_t;
+
+// v0 is hardware wired to vector mask register, which should be always reserved
+// convert idx (0..23) to reg index
+#define EXTREG(A) (((A) < 16) ? (16 + (A)) : ((A) - 8))
+// convert reg index (8..31) to idx (0..23)
+#define EXTIDX(A) (((A) >= 16) ? ((A) - 16) : ((A) + 8))
+
+static inline void sse_sync_cache_type(extcache_t* cache, int a)
+{
+    sse_cache_t* e = &cache->ssecache[a];
+    if (e->v == -1)
+        return;
+    if (!e->vector) {
+        cache->extcache[EXTIDX(e->reg)].t = e->single ? EXT_CACHE_SS : EXT_CACHE_SD;
+        return;
+    }
+    int dirty = e->write || e->ymm0;
+    if (e->ymm)
+        cache->extcache[EXTIDX(e->reg)].t = dirty ? EXT_CACHE_YMMW : EXT_CACHE_YMMR;
+    else
+        cache->extcache[EXTIDX(e->reg)].t = dirty ? EXT_CACHE_XMMW : EXT_CACHE_XMMR;
+}
+
+static inline void sse_sync_all_cache_types(extcache_t* cache)
+{
+    for (int i = 0; i < 16; ++i)
+        sse_sync_cache_type(cache, i);
+}
+
+void add_next(dynarec_rv64_t *dyn, uintptr_t addr);
+uintptr_t get_closest_next(dynarec_rv64_t *dyn, uintptr_t addr);
+void add_jump(dynarec_rv64_t *dyn, int ninst);
+int get_first_jump(dynarec_rv64_t *dyn, int next);
+int get_first_jump_addr(dynarec_rv64_t *dyn, uintptr_t next);
+int is_nops(dynarec_rv64_t *dyn, uintptr_t addr, int n);
+
+int isTable64(dynarec_rv64_t *dyn, uint64_t val); // return 1 if val already in Table64
+int Table64(dynarec_rv64_t *dyn, uint64_t val, int pass);  // add a value to table64 (if needed) and gives back the imm19 to use in LDR_literal
+
+void CreateJmpNext(void* addr, void* next);
+
+// While we could theoretically traverse forward to find the flags-consuming x86
+// instruction and get the exact scratch registers to save, this is too complicated.
+// So we went with the simpler approach of saving all scratch registers, this won't
+// add noticeable performance overhead in trace mode.
+#define SPILL_NF_REGISTERS       \
+    do {                         \
+        SUBI(xSP, xSP, 6 * 8);   \
+        SD(x1, xSP, 0 * 8);      \
+        SD(x2, xSP, 1 * 8);      \
+        SD(x3, xSP, 2 * 8);      \
+        SD(x4, xSP, 3 * 8);      \
+        SD(x5, xSP, 4 * 8);      \
+        SD(x6, xSP, 5 * 8);      \
+    } while(0);
+
+#define RESTORE_NF_REGISTERS     \
+    do {                         \
+        LD(x1, xSP, 0 * 8);      \
+        LD(x2, xSP, 1 * 8);      \
+        LD(x3, xSP, 2 * 8);      \
+        LD(x4, xSP, 3 * 8);      \
+        LD(x5, xSP, 4 * 8);      \
+        LD(x6, xSP, 5 * 8);      \
+        ADDI(xSP, xSP, 6 * 8);   \
+    } while(0);
+
+#define GO_TRACE(A, B, s0)       \
+    GETIP(addr, s0);             \
+    MV(x1, xRIP);                \
+    STORE_XEMU_CALL(s0);         \
+    MOV64x(x2, B);               \
+    CALL(const_##A, -1, x1, x2); \
+    LOAD_XEMU_CALL()
+
+#endif //__DYNAREC_RV64_PRIVATE_H_

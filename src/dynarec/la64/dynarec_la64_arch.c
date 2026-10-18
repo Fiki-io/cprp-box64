@@ -1,0 +1,299 @@
+// SPDX-License-Identifier: MIT
+#include <stddef.h>
+#include <stdio.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <string.h>
+
+#include "debug.h"
+#include "dynablock.h"
+#include "x64emu.h"
+#include "emu/x64emu_private.h"
+#include "emu/x64run_private.h"
+#include "dynarec/dynablock_private.h"
+#include "dynarec_la64_arch.h"
+#include "dynarec_la64_functions.h"
+#include "dynarec_la64_private.h"
+
+typedef struct arch_arch_s
+{
+    uint16_t unaligned : 1;
+    uint16_t host_call : 1; // instruction performs a native call
+    uint16_t vec : 1;       // vector registers of the block are cached
+    uint16_t seq : 9;       // how many instruction on the same values
+    uint16_t up32;          // GPRs with pending 32-bit zero-up at this instruction
+    uint16_t ymm_zero;      // YMM upper halves with a deferred architectural zero
+    int16_t rsp;            // pending rsp offset at this instruction
+    uint32_t call_window;   // spill offset within the instruction
+    uint16_t xmm;           // XMMs with their value cached in a vector register
+    uint16_t ymm;           // YMM upper halves cached in a vector register
+    uint8_t x87;            // x87 stack registers cached in a vector register
+    uint8_t mmx;            // MMX registers cached in a vector register
+    uint32_t x87_pos;       // vector register of each stack register, 3 bits each
+    uint16_t x87_type;      // type of each cached x87 value, 2 bits each
+    int8_t x87delta;        // pending x87 stack count at this instruction
+} arch_arch_t;
+
+typedef struct arch_build_s
+{
+    uint8_t unaligned;
+    uint8_t host_call;
+    uint16_t vec;
+    uint16_t up32;
+    uint16_t ymm_zero;
+    int16_t rsp;
+    uint32_t call_window;
+    uint16_t xmm;
+    uint16_t ymm;
+    uint8_t x87;
+    uint8_t mmx;
+    uint32_t x87_pos;
+    uint16_t x87_type;
+    int8_t x87delta;
+} arch_build_t;
+
+static int arch_build(dynarec_la64_t* dyn, int ninst, arch_build_t* arch)
+{
+    memset(arch, 0, sizeof(arch_build_t));
+    // opcode can handle unaligned
+    arch->unaligned = dyn->insts[ninst].unaligned;
+    arch->host_call = dyn->insts[ninst].host_call;
+    arch->call_window = dyn->insts[ninst].call_window;
+    // pending 32-bit zero-ups at this instruction
+    arch->up32 = dyn->insts[ninst].up32_pending;
+    arch->ymm_zero = dyn->insts[ninst].vector_liveness.ymm_pending;
+    arch->rsp = dyn->insts[ninst].rsp_entry;
+    arch->x87delta = dyn->insts[ninst].lsx.x87stack;
+    for (int i = 0; i < 16; ++i) {
+        if (dyn->insts[ninst].lsx.ssecache[i].v != -1) arch->xmm |= (uint16_t)(1 << i);
+        if (dyn->insts[ninst].lsx.avxcache[i].v != -1) arch->ymm |= (uint16_t)(1 << i);
+    }
+    for (int i = 16; i < 24; ++i) {
+        int n = dyn->insts[ninst].lsx.lsxcache[i].n;
+        if (dyn->insts[ninst].lsx.lsxcache[i].v) {
+            switch (dyn->insts[ninst].lsx.lsxcache[i].t) {
+                case LSX_CACHE_ST_D:
+                case LSX_CACHE_ST_F:
+                case LSX_CACHE_ST_I64:
+                    if (n < 0 || n > 7) break;
+                    arch->x87 |= (uint8_t)(1 << n);
+                    arch->x87_pos |= (uint32_t)(i - 16) << (n * 3);
+                    arch->x87_type |= (uint16_t)(dyn->insts[ninst].lsx.lsxcache[i].t -
+                                                 LSX_CACHE_ST_D)
+                                      << (n * 2);
+                    break;
+                case LSX_CACHE_MM:
+                    if (i == 16 + n) arch->mmx |= (uint8_t)(1 << n);
+                    break;
+                default: break;
+            }
+        }
+    }
+    arch->vec = (arch->xmm || arch->ymm || arch->x87 || arch->mmx);
+    return arch->unaligned || arch->host_call || arch->vec || arch->up32 || arch->ymm_zero ||
+           arch->rsp || arch->x87delta;
+}
+
+size_t get_size_arch(dynarec_la64_t* dyn)
+{
+    arch_build_t build = {0};
+    arch_build_t previous = {0};
+    size_t sz = 0;
+    int seq = 0;
+    int nseq = 0;
+    int last = 0;
+    if(!dyn->size) return 0;
+    for(int i=0; i<dyn->size; ++i) {
+        last = arch_build(dyn, i, &build);
+        if((!memcmp(&build, &previous, sizeof(arch_build_t))) && (seq<((1<<9)-1)) && i) {
+            // same sequence, increment
+            ++seq;
+        } else {
+            seq = 0;
+            ++nseq;
+            memcpy(&previous, &build, sizeof(arch_build_t));
+            sz+=sizeof(arch_arch_t);
+        }
+    }
+    if(nseq==1 && !last)
+        return 0;   //empty, no flags, no nothing
+    return sz;
+}
+
+static void build_next(arch_arch_t* arch, arch_build_t* build)
+{
+    arch->unaligned = build->unaligned;
+    arch->host_call = build->host_call;
+    arch->call_window = build->call_window;
+    arch->seq = 0;
+    arch->up32 = build->up32;
+    arch->ymm_zero = build->ymm_zero;
+    arch->rsp = build->rsp;
+    arch->vec = build->vec;
+    arch->xmm = build->xmm;
+    arch->ymm = build->ymm;
+    arch->x87 = build->x87;
+    arch->mmx = build->mmx;
+    arch->x87_pos = build->x87_pos;
+    arch->x87_type = build->x87_type;
+    arch->x87delta = build->x87delta;
+}
+
+void* populate_arch(dynarec_la64_t* dyn, void* p, size_t sz)
+{
+    (void)sz;
+    arch_build_t build = {0};
+    arch_build_t previous = {0};
+    arch_arch_t* arch = p;
+    arch_arch_t* next = p;
+    int seq = 0;
+    for(int i=0; i<dyn->size; ++i) {
+        arch_build(dyn, i, &build);
+        if((!memcmp(&build, &previous, sizeof(arch_build_t))) && (seq<((1<<9)-1)) && i) {
+            // same sequence, increment
+            seq++;
+            arch->seq = seq;
+        } else {
+            arch = next;
+            build_next(arch, &build);
+            seq = 0;
+            memcpy(&previous, &build, sizeof(arch_build_t));
+            next = (arch_arch_t*)((uintptr_t)arch+sizeof(arch_arch_t));
+        }
+    }
+    return p;
+}
+
+int getX64AddressInst(dynablock_t* db, uintptr_t x64pc); // define is signal.c
+
+static arch_arch_t* arch_for_ninst(dynablock_t* db, int ninst)
+{
+    arch_arch_t* arch = db->arch;
+    arch_arch_t* next = arch;
+    int i = -1;
+    while(i<ninst) {
+        arch = next;
+        i += 1+arch->seq;
+        next = (arch_arch_t*)((uintptr_t)next+sizeof(arch_arch_t));
+    }
+    return arch;
+}
+
+int arch_unaligned(dynablock_t* db, uintptr_t x64pc)
+{
+    if(!db)
+        return 0;
+    if(!db->arch_size || !db->arch)
+        return 0;
+    int ninst = getX64AddressInst(db, x64pc);
+    if(ninst<0) {
+        return 0;
+    }
+    // look for state at ninst
+    arch_arch_t* arch = arch_for_ninst(db, ninst);
+    return arch->unaligned;
+}
+
+int arch_host_call(dynablock_t* db, void* native_pc, uintptr_t x64pc)
+{
+    if (!db) return 0;
+    if (!db->arch_size || !db->arch) return 0;
+    int ninst = getX64AddressInst(db, x64pc);
+    if (ninst < 0 || ninst >= db->isize) return 0;
+    arch_arch_t* arch = arch_for_ninst(db, ninst);
+    if (!arch->host_call || !arch->call_window) return 0;
+    // getX64Address
+    uintptr_t addr = (uintptr_t)db->block + db->prefixsize;
+    int i = 0;
+    for (int inst = 0; inst < ninst; ++inst) {
+        do {
+            addr += db->instsize[i].nat * 4;
+            ++i;
+        } while ((db->instsize[i - 1].x64 == 15) || (db->instsize[i - 1].nat == 15));
+    }
+    return ((uintptr_t)native_pc - addr) >= arch->call_window;
+}
+
+void adjust_arch(dynablock_t* db, x64emu_t* emu, ucontext_t* p, uintptr_t x64pc)
+{
+    if(!db) return;
+    if(!db->arch_size || !db->arch) return;
+    int ninst = getX64AddressInst(db, x64pc);
+    if(ninst < 0 || ninst >= db->isize) return;
+    arch_arch_t* arch = arch_for_ninst(db, ninst);
+    uint16_t up32 = arch->up32;
+    while(up32) {
+        int r = __builtin_ctz(up32);
+        up32 &= up32 - 1;
+        emu->regs[r].q[0] &= 0xffffffffULL;
+    }
+    uint16_t ymm_zero = arch->ymm_zero;
+    while (ymm_zero) {
+        int r = __builtin_ctz(ymm_zero);
+        ymm_zero &= ymm_zero - 1;
+        emu->ymm[r].u128 = 0;
+    }
+    if (arch->rsp && !arch->host_call) emu->regs[_SP].q[0] += arch->rsp;
+    if (arch->x87delta) {
+        emu->fpu_stack += arch->x87delta;
+        emu->top = (emu->top - arch->x87delta) & 7;
+    }
+    if (arch->vec && !arch->host_call) {
+        struct sctx_info* info = (struct sctx_info*)p->uc_mcontext.__extcontext;
+        uint64_t* vec = NULL;
+        int stride = 0;
+        while (info->magic && !vec) {
+            if (info->magic == LSX_CTX_MAGIC || info->magic == LASX_CTX_MAGIC ||
+                info->magic == FPU_CTX_MAGIC) {
+                stride = (info->magic == LASX_CTX_MAGIC)
+                             ? 4
+                             : ((info->magic == LSX_CTX_MAGIC) ? 2 : 1);
+                vec = (uint64_t*)((uintptr_t)info + sizeof(struct sctx_info));
+            } else {
+                info = (struct sctx_info*)((uintptr_t)info + info->size);
+            }
+        }
+        if (vec) {
+            uint16_t xmm = arch->xmm;
+            uint16_t ymm = arch->ymm;
+            for (int i = 0; i < 16; ++i) {
+                if (!((xmm >> i) & 1) && !((ymm >> i) & 1)) continue;
+                if (stride == 1) {
+                    emu->xmm[i].q[0] = vec[i];
+                } else {
+                    memcpy(&emu->xmm[i].u128, &vec[i * stride], 16);
+                    if ((ymm >> i) & 1) {
+                        if ((arch->ymm_zero >> i) & 1)
+                            emu->ymm[i].u128 = 0;
+                        else if (stride == 4)
+                            memcpy(&emu->ymm[i].u128, &vec[i * stride + 2], 16);
+                    }
+                }
+            }
+            uint8_t x87 = arch->x87;
+            while (x87) {
+                int i = __builtin_ctz(x87);
+                x87 &= x87 - 1;
+                int slot = 16 + ((arch->x87_pos >> (i * 3)) & 7);
+                uint64_t raw = vec[slot * stride];
+                switch ((arch->x87_type >> (i * 2)) & 3) {
+                    case LSX_CACHE_ST_D - LSX_CACHE_ST_D:
+                        emu->x87[(emu->top + i) & 7].d = *(double*)&raw;
+                        break;
+                    case LSX_CACHE_ST_F - LSX_CACHE_ST_D:
+                        emu->x87[(emu->top + i) & 7].d = *(float*)&raw;
+                        break;
+                    default:
+                        emu->x87[(emu->top + i) & 7].d = *(int64_t*)&raw;
+                        break;
+                }
+            }
+            uint8_t mmx = arch->mmx;
+            while (mmx) {
+                int i = __builtin_ctz(mmx);
+                mmx &= mmx - 1;
+                emu->mmx[i].q = vec[(16 + i) * stride] & 0xffffffffffffffffULL;
+            }
+        }
+    }
+}

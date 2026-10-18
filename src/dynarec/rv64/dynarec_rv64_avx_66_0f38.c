@@ -1,0 +1,2529 @@
+// SPDX-License-Identifier: MIT
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <errno.h>
+
+#include "debug.h"
+#include "box64context.h"
+#include "box64cpu.h"
+#include "emu/x64emu_private.h"
+#include "x64emu.h"
+#include "box64stack.h"
+#include "callback.h"
+#include "emu/x64run_private.h"
+#include "x64trace.h"
+#include "dynarec_native.h"
+#include "my_cpuid.h"
+#include "emu/x87emu_private.h"
+#include "emu/x64shaext.h"
+
+#include "rv64_printer.h"
+#include "dynarec_rv64_private.h"
+#include "dynarec_rv64_functions.h"
+#include "../dynarec_helper.h"
+
+uintptr_t dynarec64_AVX_66_0F38(dynarec_rv64_t* dyn, uintptr_t addr, uintptr_t ip, int ninst, vex_t vex, int* ok, int* need_epilog)
+{
+    (void)ip;
+    (void)need_epilog;
+
+    uint8_t opcode = F8;
+    uint8_t nextop, u8;
+    uint8_t gd, ed, vd;
+    uint8_t wback, wb1, wb2, gback, vback;
+    uint8_t eb1, eb2, gb1, gb2;
+    int32_t i32, i32_;
+    int cacheupd = 0;
+    int v0, v1, v2;
+    int q0, q1, q2;
+    int d0, d1, d2;
+    int s0;
+    uint64_t tmp64u, u64;
+    int64_t j64;
+    int64_t fixedaddress, gdoffset, vxoffset, gyoffset, vyoffset;
+    int unscaled;
+
+    rex_t rex = vex.rex;
+
+    switch (opcode) {
+        case 0x00:
+            INST_NAME("VPSHUFB Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, vex.l ? 31 : 15);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            if (gd == vex.v) {
+                ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                LD(x3, vback, vxoffset + 0);
+                LD(x4, vback, vxoffset + 8);
+                SD(x3, x5, 0);
+                SD(x4, x5, 8);
+                vback = x5;
+                vxoffset = 0;
+            }
+
+            for (int i = 0; i < 16; ++i) {
+                LB(x3, wback, fixedaddress + i);
+                BGE(x3, xZR, 4 + 4 * 2);
+                SB(xZR, gback, gdoffset + i);
+                J(4 + 4 * 4); // continue
+                ANDI(x4, x3, 15);
+                ADD(x4, x4, vback);
+                LBU(x4, x4, vxoffset);
+                SB(x4, gback, gdoffset + i);
+            }
+
+            if (vex.l) {
+                GETEY();
+                if (gd == vex.v) {
+                    LD(x3, xEmu, vyoffset + 0);
+                    LD(x4, xEmu, vyoffset + 8);
+                    SD(x3, x5, 0);
+                    SD(x4, x5, 8);
+                    vback = x5;
+                    vyoffset = 0;
+                }
+                for (int i = 0; i < 16; ++i) {
+                    LB(x3, wback, fixedaddress + i);
+                    BGE(x3, xZR, 4 + 4 * 2);
+                    SB(xZR, gback, gyoffset + i);
+                    J(4 + 4 * 4); // continue
+                    ANDI(x4, x3, 15);
+                    ADD(x4, x4, vback);
+                    LBU(x4, x4, vyoffset);
+                    SB(x4, gback, gyoffset + i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x01:
+        case 0x03:
+            if (opcode == 0x01)
+                INST_NAME("VPHADDW Gx, Vx, Ex");
+            else
+                INST_NAME("VPHADDSW Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, vex.l ? 30 : 14);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            LUI(x6, 0xFFFF8); // -32768
+            LUI(x7, 0x8);     // 32768
+            ADDIW(x7, x7, -1);
+            if (gd == ed) {
+                ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                LD(x3, wback, fixedaddress + 0);
+                LD(x4, wback, fixedaddress + 8);
+                SD(x3, x5, 0);
+                SD(x4, x5, 8);
+                wback = x5;
+                fixedaddress = 0;
+            }
+            for (int i = 0; i < 4; ++i) {
+                // GX->sw[i] = VX->sw[i*2+0]+VX->sw[i*2+1];
+                LH(x3, vback, vxoffset + 2 * (i * 2 + 0));
+                LH(x4, vback, vxoffset + 2 * (i * 2 + 1));
+                ADDW(x3, x3, x4);
+                if (opcode == 0x03) SATw(x3, x6, x7);
+                SH(x3, gback, gdoffset + 2 * i);
+            }
+            if (MODREG && ed == vex.v) {
+                // GX->q[1] = GX->q[0];
+                LD(x3, gback, gdoffset + 0);
+                SD(x3, gback, gdoffset + 8);
+            } else {
+                for (int i = 0; i < 4; ++i) {
+                    // GX->sw[4+i] = EX->sw[i*2+0]+EX->sw[i*2+1];
+                    LH(x3, wback, fixedaddress + 2 * (i * 2 + 0));
+                    LH(x4, wback, fixedaddress + 2 * (i * 2 + 1));
+                    ADDW(x3, x3, x4);
+                    if (opcode == 0x03) SATw(x3, x6, x7);
+                    SH(x3, gback, gdoffset + 2 * (4 + i));
+                }
+            }
+            if (vex.l) {
+                GETEY();
+                if (gd == ed) {
+                    ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                    LD(x3, wback, fixedaddress + 0);
+                    LD(x4, wback, fixedaddress + 8);
+                    SD(x3, x5, 0);
+                    SD(x4, x5, 8);
+                    wback = x5;
+                    fixedaddress = 0;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    // GY->sw[i] = VY->sw[i*2+0]+VY->sw[i*2+1];
+                    LH(x3, vback, vyoffset + 2 * (i * 2 + 0));
+                    LH(x4, vback, vyoffset + 2 * (i * 2 + 1));
+                    ADDW(x3, x3, x4);
+                    if (opcode == 0x03) SATw(x3, x6, x7);
+                    SH(x3, gback, gyoffset + 2 * i);
+                }
+                if (MODREG && ed == vex.v) {
+                    // GY->q[1] = GY->q[0];
+                    LD(x3, gback, gyoffset + 0);
+                    SD(x3, gback, gyoffset + 8);
+                } else {
+                    for (int i = 0; i < 4; ++i) {
+                        // GY->sw[4+i] = EY->sw[i*2+0]+EY->sw[i*2+1];
+                        LH(x3, wback, fixedaddress + 2 * (i * 2 + 0));
+                        LH(x4, wback, fixedaddress + 2 * (i * 2 + 1));
+                        ADDW(x3, x3, x4);
+                        if (opcode == 0x03) SATw(x3, x6, x7);
+                        SH(x3, gback, gyoffset + 2 * (4 + i));
+                    }
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x02:
+            INST_NAME("VPHADDD Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, vex.l ? 28 : 12);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            if (gd == ed) {
+                ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                LD(x3, wback, fixedaddress + 0);
+                LD(x4, wback, fixedaddress + 8);
+                SD(x3, x5, 0);
+                SD(x4, x5, 8);
+                wback = x5;
+                fixedaddress = 0;
+            }
+            for (int i = 0; i < 2; ++i) {
+                // GX->sd[i] = VX->sd[i*2+0]+VX->sd[i*2+1];
+                LW(x3, vback, vxoffset + 4 * (i * 2 + 0));
+                LW(x4, vback, vxoffset + 4 * (i * 2 + 1));
+                ADDW(x3, x3, x4);
+                SW(x3, gback, gdoffset + 4 * i);
+            }
+            if (MODREG && ed == vex.v) {
+                // GX->q[1] = GX->q[0];
+                LD(x3, gback, gdoffset + 0);
+                SD(x3, gback, gdoffset + 8);
+            } else {
+                for (int i = 0; i < 2; ++i) {
+                    // GX->sd[4+i] = EX->sd[i*2+0]+EX->sd[i*2+1];
+                    LW(x3, wback, fixedaddress + 4 * (i * 2 + 0));
+                    LW(x4, wback, fixedaddress + 4 * (i * 2 + 1));
+                    ADDW(x3, x3, x4);
+                    SW(x3, gback, gdoffset + 4 * (2 + i));
+                }
+            }
+            if (vex.l) {
+                GETEY();
+                if (gd == ed) {
+                    ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                    LD(x3, wback, fixedaddress + 0);
+                    LD(x4, wback, fixedaddress + 8);
+                    SD(x3, x5, 0);
+                    SD(x4, x5, 8);
+                    wback = x5;
+                    fixedaddress = 0;
+                }
+                for (int i = 0; i < 2; ++i) {
+                    // GY->sd[i] = VY->sd[i*2+0]+VY->sd[i*2+1];
+                    LW(x3, vback, vyoffset + 4 * (i * 2 + 0));
+                    LW(x4, vback, vyoffset + 4 * (i * 2 + 1));
+                    ADDW(x3, x3, x4);
+                    SW(x3, gback, gyoffset + 4 * i);
+                }
+                if (MODREG && ed == vex.v) {
+                    // GY->q[1] = GY->q[0];
+                    LD(x3, gback, gyoffset + 0);
+                    SD(x3, gback, gyoffset + 8);
+                } else {
+                    for (int i = 0; i < 2; ++i) {
+                        // GY->sd[4+i] = EY->sd[i*2+0]+EY->sd[i*2+1];
+                        LW(x3, wback, fixedaddress + 4 * (i * 2 + 0));
+                        LW(x4, wback, fixedaddress + 4 * (i * 2 + 1));
+                        ADDW(x3, x3, x4);
+                        SW(x3, gback, gyoffset + 4 * (2 + i));
+                    }
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x04:
+            INST_NAME("VPMADDUBSW Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, vex.l ? 31 : 15);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            LUI(x6, 0xFFFF8); // -32768
+            LUI(x7, 0x8);     // 32768
+            ADDIW(x7, x7, -1);
+            for (int i = 0; i < 8; ++i) {
+                LBU(x3, vback, vxoffset + i * 2);
+                LB(x4, wback, fixedaddress + i * 2);
+                MUL(x2, x3, x4);
+                LBU(x3, vback, vxoffset + i * 2 + 1);
+                LB(x4, wback, fixedaddress + i * 2 + 1);
+                MUL(x3, x3, x4);
+                ADD(x3, x3, x2);
+                SATw(x3, x6, x7);
+                SH(x3, gback, gdoffset + i * 2);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 8; ++i) {
+                    LBU(x3, vback, vyoffset + i * 2);
+                    LB(x4, wback, fixedaddress + i * 2);
+                    MUL(x2, x3, x4);
+                    LBU(x3, vback, vyoffset + i * 2 + 1);
+                    LB(x4, wback, fixedaddress + i * 2 + 1);
+                    MUL(x3, x3, x4);
+                    ADD(x3, x3, x2);
+                    SATw(x3, x6, x7);
+                    SH(x3, gback, gyoffset + i * 2);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x05:
+        case 0x07:
+            if (opcode == 0x05)
+                INST_NAME("VPHSUBW Gx, Vx, Ex");
+            else
+                INST_NAME("VPHSUBSW Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, vex.l ? 30 : 14);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            LUI(x6, 0xFFFF8); // -32768
+            LUI(x7, 0x8);     // 32768
+            ADDIW(x7, x7, -1);
+            if (gd == ed) {
+                ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                LD(x3, wback, fixedaddress + 0);
+                LD(x4, wback, fixedaddress + 8);
+                SD(x3, x5, 0);
+                SD(x4, x5, 8);
+                wback = x5;
+                fixedaddress = 0;
+            }
+            for (int i = 0; i < 4; ++i) {
+                // GX->sw[i] = VX->sw[i*2+0]-VX->sw[i*2+1];
+                LH(x3, vback, vxoffset + 2 * (i * 2 + 0));
+                LH(x4, vback, vxoffset + 2 * (i * 2 + 1));
+                SUBW(x3, x3, x4);
+                if (opcode == 0x07) SATw(x3, x6, x7);
+                SH(x3, gback, gdoffset + 2 * i);
+            }
+            if (MODREG && ed == vex.v) {
+                // GX->q[1] = GX->q[0];
+                LD(x3, gback, gdoffset + 0);
+                SD(x3, gback, gdoffset + 8);
+            } else {
+                for (int i = 0; i < 4; ++i) {
+                    // GX->sw[4+i] = EX->sw[i*2+0]-EX->sw[i*2+1];
+                    LH(x3, wback, fixedaddress + 2 * (i * 2 + 0));
+                    LH(x4, wback, fixedaddress + 2 * (i * 2 + 1));
+                    SUBW(x3, x3, x4);
+                    if (opcode == 0x07) SATw(x3, x6, x7);
+                    SH(x3, gback, gdoffset + 2 * (4 + i));
+                }
+            }
+            if (vex.l) {
+                GETEY();
+                if (gd == ed) {
+                    ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                    LD(x3, wback, fixedaddress + 0);
+                    LD(x4, wback, fixedaddress + 8);
+                    SD(x3, x5, 0);
+                    SD(x4, x5, 8);
+                    wback = x5;
+                    fixedaddress = 0;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    // GY->sw[i] = VY->sw[i*2+0]-VY->sw[i*2+1];
+                    LH(x3, vback, vyoffset + 2 * (i * 2 + 0));
+                    LH(x4, vback, vyoffset + 2 * (i * 2 + 1));
+                    SUBW(x3, x3, x4);
+                    if (opcode == 0x07) SATw(x3, x6, x7);
+                    SH(x3, gback, gyoffset + 2 * i);
+                }
+                if (MODREG && ed == vex.v) {
+                    // GY->q[1] = GY->q[0];
+                    LD(x3, gback, gyoffset + 0);
+                    SD(x3, gback, gyoffset + 8);
+                } else {
+                    for (int i = 0; i < 4; ++i) {
+                        // GY->sw[4+i] = EY->sw[i*2+0]-EY->sw[i*2+1];
+                        LH(x3, wback, fixedaddress + 2 * (i * 2 + 0));
+                        LH(x4, wback, fixedaddress + 2 * (i * 2 + 1));
+                        SUBW(x3, x3, x4);
+                        if (opcode == 0x07) SATw(x3, x6, x7);
+                        SH(x3, gback, gyoffset + 2 * (4 + i));
+                    }
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x06:
+            INST_NAME("VPHSUBD Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, vex.l ? 28 : 12);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            if (gd == ed) {
+                ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                LD(x3, wback, fixedaddress + 0);
+                LD(x4, wback, fixedaddress + 8);
+                SD(x3, x5, 0);
+                SD(x4, x5, 8);
+                wback = x5;
+                fixedaddress = 0;
+            }
+            for (int i = 0; i < 2; ++i) {
+                // GX->sd[i] = VX->sd[i*2+0]-VX->sd[i*2+1];
+                LW(x3, vback, vxoffset + 4 * (i * 2 + 0));
+                LW(x4, vback, vxoffset + 4 * (i * 2 + 1));
+                SUBW(x3, x3, x4);
+                SW(x3, gback, gdoffset + 4 * i);
+            }
+            if (MODREG && ed == vex.v) {
+                // GX->q[1] = GX->q[0];
+                LD(x3, gback, gdoffset + 0);
+                SD(x3, gback, gdoffset + 8);
+            } else {
+                for (int i = 0; i < 2; ++i) {
+                    // GX->sd[4+i] = EX->sd[i*2+0]-EX->sd[i*2+1];
+                    LW(x3, wback, fixedaddress + 4 * (i * 2 + 0));
+                    LW(x4, wback, fixedaddress + 4 * (i * 2 + 1));
+                    SUBW(x3, x3, x4);
+                    SW(x3, gback, gdoffset + 4 * (2 + i));
+                }
+            }
+            if (vex.l) {
+                GETEY();
+                if (gd == ed) {
+                    ADDI(x5, xEmu, offsetof(x64emu_t, scratch));
+                    LD(x3, wback, fixedaddress + 0);
+                    LD(x4, wback, fixedaddress + 8);
+                    SD(x3, x5, 0);
+                    SD(x4, x5, 8);
+                    wback = x5;
+                    fixedaddress = 0;
+                }
+                for (int i = 0; i < 2; ++i) {
+                    // GY->sd[i] = VY->sd[i*2+0]-VY->sd[i*2+1];
+                    LW(x3, vback, vyoffset + 4 * (i * 2 + 0));
+                    LW(x4, vback, vyoffset + 4 * (i * 2 + 1));
+                    SUBW(x3, x3, x4);
+                    SW(x3, gback, gyoffset + 4 * i);
+                }
+                if (MODREG && ed == vex.v) {
+                    // GY->q[1] = GY->q[0];
+                    LD(x3, gback, gyoffset + 0);
+                    SD(x3, gback, gyoffset + 8);
+                } else {
+                    for (int i = 0; i < 2; ++i) {
+                        // GY->sd[4+i] = EY->sd[i*2+0]-EY->sd[i*2+1];
+                        LW(x3, wback, fixedaddress + 4 * (i * 2 + 0));
+                        LW(x4, wback, fixedaddress + 4 * (i * 2 + 1));
+                        SUBW(x3, x3, x4);
+                        SW(x3, gback, gyoffset + 4 * (2 + i));
+                    }
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x08:
+            INST_NAME("VPSIGNB Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x6, 0, vex.l ? 31 : 15);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 16; ++i) {
+                LB(x3, vback, vxoffset + i);
+                LB(x4, wback, fixedaddress + i);
+                SLT(x1, xZR, x4);
+                SRAI(x5, x4, 63);
+                OR(x1, x1, x5);
+                MUL(x3, x1, x3);
+                SB(x3, gback, gdoffset + i);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 16; ++i) {
+                    LB(x3, vback, vyoffset + i);
+                    LB(x4, wback, fixedaddress + i);
+                    SLT(x1, xZR, x4);
+                    SRAI(x5, x4, 63);
+                    OR(x1, x1, x5);
+                    MUL(x3, x1, x3);
+                    SB(x3, gback, gyoffset + i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x09:
+            INST_NAME("VPSIGNW Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x6, 0, vex.l ? 30 : 14);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 8; ++i) {
+                LH(x3, vback, vxoffset + i * 2);
+                LH(x4, wback, fixedaddress + i * 2);
+                SLT(x1, xZR, x4);
+                SRAI(x5, x4, 63);
+                OR(x1, x1, x5);
+                MUL(x3, x1, x3);
+                SH(x3, gback, gdoffset + i * 2);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 8; ++i) {
+                    LH(x3, vback, vyoffset + i * 2);
+                    LH(x4, wback, fixedaddress + i * 2);
+                    SLT(x1, xZR, x4);
+                    SRAI(x5, x4, 63);
+                    OR(x1, x1, x5);
+                    MUL(x3, x1, x3);
+                    SH(x3, gback, gyoffset + i * 2);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x0A:
+            INST_NAME("VPSIGND Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x6, 0, vex.l ? 28 : 12);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 4; ++i) {
+                LW(x3, vback, vxoffset + i * 4);
+                LW(x4, wback, fixedaddress + i * 4);
+                SLT(x1, xZR, x4);
+                SRAI(x5, x4, 63);
+                OR(x1, x1, x5);
+                MUL(x3, x1, x3);
+                SW(x3, gback, gdoffset + i * 4);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vyoffset + i * 4);
+                    LW(x4, wback, fixedaddress + i * 4);
+                    SLT(x1, xZR, x4);
+                    SRAI(x5, x4, 63);
+                    OR(x1, x1, x5);
+                    MUL(x3, x1, x3);
+                    SW(x3, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x0B:
+            INST_NAME("VPMULHRSW Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, vex.l ? 30 : 14);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 8; ++i) {
+                LH(x3, gback, vxoffset + i * 2);
+                LH(x4, wback, fixedaddress + i * 2);
+                MUL(x3, x3, x4);
+                SRAI(x3, x3, 14);
+                ADDI(x3, x3, 1);
+                SRAI(x3, x3, 1);
+                SH(x3, gback, gdoffset + i * 2);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 8; ++i) {
+                    LH(x3, gback, vyoffset + i * 2);
+                    LH(x4, wback, fixedaddress + i * 2);
+                    MUL(x3, x3, x4);
+                    SRAI(x3, x3, 14);
+                    ADDI(x3, x3, 1);
+                    SRAI(x3, x3, 1);
+                    SH(x3, gback, gyoffset + i * 2);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x0C:
+            INST_NAME("VPERMILPS Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETGY();
+            LD(x3, vback, vxoffset + 0);
+            SD(x3, xEmu, offsetof(x64emu_t, scratch) + 0);
+            LD(x3, vback, vxoffset + 8);
+            SD(x3, xEmu, offsetof(x64emu_t, scratch) + 8);
+            LD(x3, wback, fixedaddress + 0);
+            SD(x3, xEmu, offsetof(x64emu_t, scratch) + 16);
+            LD(x3, wback, fixedaddress + 8);
+            SD(x3, xEmu, offsetof(x64emu_t, scratch) + 24);
+            for (int i = 0; i < 4; ++i) {
+                LWU(x4, xEmu, offsetof(x64emu_t, scratch) + 16 + 4 * i);
+                ANDI(x4, x4, 3);
+                ADDSL(x4, xEmu, x4, 2, x4);
+                LWU(x5, x4, offsetof(x64emu_t, scratch) + 0);
+                SW(x5, gback, gdoffset + 4 * i);
+            }
+            if (vex.l) {
+                GETEY();
+                GETVY();
+                LD(x3, vback, vyoffset + 0);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + 0);
+                LD(x3, vback, vyoffset + 8);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + 8);
+                LD(x3, wback, fixedaddress + 0);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + 16);
+                LD(x3, wback, fixedaddress + 8);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + 24);
+                for (int i = 0; i < 4; ++i) {
+                    LWU(x4, xEmu, offsetof(x64emu_t, scratch) + 16 + 4 * i);
+                    ANDI(x4, x4, 3);
+                    ADDSL(x4, xEmu, x4, 2, x4);
+                    LWU(x5, x4, offsetof(x64emu_t, scratch) + 0);
+                    SW(x5, gback, gyoffset + 4 * i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x0D:
+            INST_NAME("VPERMILPD Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 24 : 8);
+            GETVX();
+            GETGY();
+            LD(x3, vback, vxoffset + 0);
+            SD(x3, xEmu, offsetof(x64emu_t, scratch) + 0);
+            LD(x3, vback, vxoffset + 8);
+            SD(x3, xEmu, offsetof(x64emu_t, scratch) + 8);
+            LD(x3, wback, fixedaddress + 0);
+            SD(x3, xEmu, offsetof(x64emu_t, scratch) + 16);
+            LD(x3, wback, fixedaddress + 8);
+            SD(x3, xEmu, offsetof(x64emu_t, scratch) + 24);
+            for (int i = 0; i < 2; ++i) {
+                LD(x4, xEmu, offsetof(x64emu_t, scratch) + 16 + 8 * i);
+                SRLI(x4, x4, 1);
+                ANDI(x4, x4, 1);
+                ADDSL(x4, xEmu, x4, 3, x4);
+                LD(x5, x4, offsetof(x64emu_t, scratch) + 0);
+                SD(x5, gback, gdoffset + 8 * i);
+            }
+            if (vex.l) {
+                GETEY();
+                GETVY();
+                LD(x3, vback, vyoffset + 0);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + 0);
+                LD(x3, vback, vyoffset + 8);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + 8);
+                LD(x3, wback, fixedaddress + 0);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + 16);
+                LD(x3, wback, fixedaddress + 8);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + 24);
+                for (int i = 0; i < 2; ++i) {
+                    LD(x4, xEmu, offsetof(x64emu_t, scratch) + 16 + 8 * i);
+                    SRLI(x4, x4, 1);
+                    ANDI(x4, x4, 1);
+                    ADDSL(x4, xEmu, x4, 3, x4);
+                    LD(x5, x4, offsetof(x64emu_t, scratch) + 0);
+                    SD(x5, gback, gyoffset + 8 * i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x13:
+            INST_NAME("VCVTPH2PS Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETGY();
+            if (MODREG) {
+                ed = (nextop & 7) + (rex.b << 3);
+                sse_forget_reg(dyn, ninst, x3, ed);
+                ADDI(x3, xEmu, offsetof(x64emu_t, xmm[ed]));
+            } else {
+                SMREAD();
+                addr = geted(dyn, addr, ninst, nextop, &wback, x2, x1, &fixedaddress, rex, NULL, 0, 0);
+                ADDI(x3, wback, fixedaddress);
+            }
+            ADDI(x2, xEmu, offsetof(x64emu_t, scratch) + 0);
+            ADDI(x4, xZR, vex.l ? 8 : 4);
+            CALL4(const_native_cvtph2ps, -1, x2, x3, x4, 0);
+            LD(x4, xEmu, offsetof(x64emu_t, scratch) + 0);
+            LD(x5, xEmu, offsetof(x64emu_t, scratch) + 8);
+            SD(x4, gback, gdoffset + 0);
+            SD(x5, gback, gdoffset + 8);
+            if (vex.l) {
+                LD(x4, xEmu, offsetof(x64emu_t, scratch) + 16);
+                LD(x5, xEmu, offsetof(x64emu_t, scratch) + 24);
+                SD(x4, gback, gyoffset + 0);
+                SD(x5, gback, gyoffset + 8);
+            } else
+                YMM0(gd);
+            break;
+        case 0x16:
+            if (!vex.l) return 0;
+            INST_NAME("VPERMPS Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, 28);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            if (MODREG) {
+                ADDI(x6, xEmu, offsetof(x64emu_t, scratch));
+                LD(x3, wback, fixedaddress + 0);
+                LD(x4, wback, fixedaddress + 8);
+                SD(x3, x6, 0);
+                SD(x4, x6, 8);
+                LD(x3, wback, fixedaddress + offsetof(x64emu_t, ymm) - offsetof(x64emu_t, xmm));
+                LD(x4, wback, fixedaddress + offsetof(x64emu_t, ymm) - offsetof(x64emu_t, xmm) + 8);
+                SD(x3, x6, 16);
+                SD(x4, x6, 24);
+                wback = x6;
+                fixedaddress = 0;
+            }
+            if (gd == vex.v) {
+                ADDI(x7, xEmu, offsetof(x64emu_t, scratch) + 32);
+                LD(x3, vback, vxoffset + 0);
+                LD(x4, vback, vxoffset + 8);
+                SD(x3, x7, 0);
+                SD(x4, x7, 8);
+                LD(x3, xEmu, vyoffset + 0);
+                LD(x4, xEmu, vyoffset + 8);
+                SD(x3, x7, 16);
+                SD(x4, x7, 24);
+                vback = x7;
+                vxoffset = 0;
+                vyoffset = 16;
+            }
+            for (int i = 0; i < 4; ++i) {
+                LWU(x3, vback, vxoffset + 4 * i);
+                ANDI(x3, x3, 7);
+                ADDSL(x4, wback, x3, 2, x3);
+                LWU(x5, x4, fixedaddress);
+                SW(x5, gback, gdoffset + 4 * i);
+            }
+            for (int i = 0; i < 4; ++i) {
+                LWU(x3, vback, vyoffset + 4 * i);
+                ANDI(x3, x3, 7);
+                ADDSL(x4, wback, x3, 2, x3);
+                LWU(x5, x4, fixedaddress);
+                SW(x5, gback, gyoffset + 4 * i);
+            }
+            break;
+        case 0x0E:
+            INST_NAME("VTESTPS Gx, Ex");
+            nextop = F8;
+            SETFLAGS(X_ALL, SF_SET, NAT_FLAGS_NOFUSION);
+            GETEX(x1, 0, vex.l ? 24 : 8);
+            GETGX();
+            GETGY();
+            CLEAR_FLAGS();
+            SET_DFNONE();
+            IFX (X_ZF | X_CF) {
+                LD(x2, wback, fixedaddress + 0);
+                LD(x3, wback, fixedaddress + 8);
+                LD(x4, gback, gdoffset + 0);
+                LD(x5, gback, gdoffset + 8);
+                IFX (X_ZF) {
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SLLI(x7, x6, 32);
+                    OR(x6, x6, x7);
+                    SRLI(x6, x6, 63);
+                    SET_FLAGS_EQZ(x6, F_ZF, x7);
+                }
+                IFX (X_CF) {
+                    NOT(x4, x4);
+                    NOT(x5, x5);
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SLLI(x7, x6, 32);
+                    OR(x6, x6, x7);
+                    SRLI(x6, x6, 63);
+                    SET_FLAGS_EQZ(x6, F_CF, x7);
+                }
+            }
+            if (vex.l) {
+                GETEY();
+                LD(x2, wback, fixedaddress + 0);
+                LD(x3, wback, fixedaddress + 8);
+                LD(x4, gback, gyoffset + 0);
+                LD(x5, gback, gyoffset + 8);
+                IFX (X_ZF) {
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SLLI(x7, x6, 32);
+                    OR(x6, x6, x7);
+                    SRLI(x6, x6, 63);
+                    BEQZ_MARK(x6);
+                    ANDI(xFlags, xFlags, ~(1 << F_ZF));
+                    MARK;
+                }
+                IFX (X_CF) {
+                    NOT(x4, x4);
+                    NOT(x5, x5);
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SLLI(x7, x6, 32);
+                    OR(x6, x6, x7);
+                    SRLI(x6, x6, 63);
+                    BEQZ_MARK2(x6);
+                    ANDI(xFlags, xFlags, ~(1 << F_CF));
+                    MARK2;
+                }
+            }
+            break;
+        case 0x0F:
+            INST_NAME("VTESTPD Gx, Ex");
+            nextop = F8;
+            SETFLAGS(X_ALL, SF_SET, NAT_FLAGS_NOFUSION);
+            GETEX(x1, 0, vex.l ? 24 : 8);
+            GETGX();
+            GETGY();
+            CLEAR_FLAGS();
+            SET_DFNONE();
+            IFX (X_ZF | X_CF) {
+                LD(x2, wback, fixedaddress + 0);
+                LD(x3, wback, fixedaddress + 8);
+                LD(x4, gback, gdoffset + 0);
+                LD(x5, gback, gdoffset + 8);
+                IFX (X_ZF) {
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SRLI(x6, x6, 63);
+                    SET_FLAGS_EQZ(x6, F_ZF, x7);
+                }
+                IFX (X_CF) {
+                    NOT(x4, x4);
+                    NOT(x5, x5);
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SRLI(x6, x6, 63);
+                    SET_FLAGS_EQZ(x6, F_CF, x7);
+                }
+            }
+            if (vex.l) {
+                GETEY();
+                LD(x2, wback, fixedaddress + 0);
+                LD(x3, wback, fixedaddress + 8);
+                LD(x4, gback, gyoffset + 0);
+                LD(x5, gback, gyoffset + 8);
+                IFX (X_ZF) {
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SRLI(x6, x6, 63);
+                    BEQZ_MARK(x6);
+                    ANDI(xFlags, xFlags, ~(1 << F_ZF));
+                    MARK;
+                }
+                IFX (X_CF) {
+                    NOT(x4, x4);
+                    NOT(x5, x5);
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SRLI(x6, x6, 63);
+                    BEQZ_MARK2(x6);
+                    ANDI(xFlags, xFlags, ~(1 << F_CF));
+                    MARK2;
+                }
+            }
+            break;
+        case 0x17:
+            INST_NAME("VPTEST Gx, Ex");
+            nextop = F8;
+            SETFLAGS(X_ALL, SF_SET, NAT_FLAGS_NOFUSION);
+            GETEX(x1, 0, vex.l ? 24 : 8);
+            GETGX();
+            GETGY();
+            CLEAR_FLAGS();
+            SET_DFNONE();
+            IFX (X_ZF | X_CF) {
+                LD(x2, wback, fixedaddress + 0);
+                LD(x3, wback, fixedaddress + 8);
+                LD(x4, gback, gdoffset + 0);
+                LD(x5, gback, gdoffset + 8);
+
+                IFX (X_ZF) {
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SET_FLAGS_EQZ(x6, F_ZF, x7);
+                }
+                IFX (X_CF) {
+                    NOT(x4, x4);
+                    NOT(x5, x5);
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    SET_FLAGS_EQZ(x6, F_CF, x7);
+                }
+            }
+            if (vex.l) {
+                GETEY();
+                LD(x2, wback, fixedaddress + 0);
+                LD(x3, wback, fixedaddress + 8);
+                LD(x4, gback, gyoffset + 0);
+                LD(x5, gback, gyoffset + 8);
+
+                IFX (X_ZF) {
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    BEQZ_MARK(x6);
+                    ANDI(xFlags, xFlags, ~(1 << F_ZF));
+                    MARK;
+                }
+                IFX (X_CF) {
+                    NOT(x4, x4);
+                    NOT(x5, x5);
+                    AND(x6, x4, x2);
+                    AND(x7, x5, x3);
+                    OR(x6, x6, x7);
+                    BEQZ_MARK2(x6);
+                    ANDI(xFlags, xFlags, ~(1 << F_CF));
+                    MARK2;
+                }
+            }
+            break;
+        case 0x18:
+            INST_NAME("VBROADCASTSS Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, 1);
+            GETGY();
+            LWU(x4, wback, fixedaddress);
+            for (int i = 0; i < 4; ++i) {
+                SW(x4, gback, gdoffset + i * 4);
+            }
+            if (vex.l) {
+                for (int i = 0; i < 4; ++i) {
+                    SW(x4, gback, gyoffset + i * 4);
+                }
+            } else {
+                YMM0(gd);
+            }
+            break;
+        case 0x19:
+            INST_NAME("VBROADCASTSD Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, 1);
+            GETGY();
+            if (!vex.l) UDF();
+            LD(x4, wback, fixedaddress);
+            for (int i = 0; i < 2; ++i) {
+                SD(x4, gback, gdoffset + i * 8);
+            }
+            for (int i = 0; i < 2; ++i) {
+                SD(x4, gback, gyoffset + i * 8);
+            }
+            break;
+        case 0x1A:
+            INST_NAME("VBROADCASTF128 Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, 8);
+            GETGY();
+            if (!vex.l || MODREG) UDF();
+            LD(x4, wback, fixedaddress);
+            LD(x5, wback, fixedaddress + 8);
+            SD(x4, gback, gdoffset);
+            SD(x5, gback, gdoffset + 8);
+            SD(x4, gback, gyoffset);
+            SD(x5, gback, gyoffset + 8);
+            break;
+        case 0x1C:
+            INST_NAME("VPABSB Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 31 : 15);
+            GETGY();
+            for (int i = 0; i < 16; ++i) {
+                LB(x4, wback, fixedaddress + i);
+                BGE(x4, xZR, 4 + 4);
+                NEG(x4, x4);
+                SB(x4, gback, gdoffset + i);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 16; ++i) {
+                    LB(x4, wback, fixedaddress + i);
+                    BGE(x4, xZR, 4 + 4);
+                    NEG(x4, x4);
+                    SB(x4, gback, gyoffset + i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x1D:
+            INST_NAME("VPABSW Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 30 : 14);
+            GETGY();
+            for (int i = 0; i < 8; ++i) {
+                LH(x4, wback, fixedaddress + i * 2);
+                BGE(x4, xZR, 4 + 4);
+                NEG(x4, x4);
+                SH(x4, gback, gdoffset + i * 2);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 8; ++i) {
+                    LH(x4, wback, fixedaddress + i * 2);
+                    BGE(x4, xZR, 4 + 4);
+                    NEG(x4, x4);
+                    SH(x4, gback, gyoffset + i * 2);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x1E:
+            INST_NAME("VPABSD Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETGY();
+            for (int i = 0; i < 4; ++i) {
+                LW(x4, wback, fixedaddress + i * 4);
+                BGE(x4, xZR, 4 + 4);
+                NEG(x4, x4);
+                SW(x4, gback, gdoffset + i * 4);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LW(x4, wback, fixedaddress + i * 4);
+                    BGE(x4, xZR, 4 + 4);
+                    NEG(x4, x4);
+                    SW(x4, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x20:
+            INST_NAME("VPMOVSXBW Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 15 : 7);
+            GETGY();
+            if (vex.l) {
+                for (int i = 7; i >= 0; --i) {
+                    LB(x3, wback, fixedaddress + 8 + i);
+                    SH(x3, gback, gyoffset + i * 2);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 7; i >= 0; --i) {
+                LB(x3, wback, fixedaddress + i);
+                SH(x3, gback, gdoffset + i * 2);
+            }
+            break;
+        case 0x21:
+            INST_NAME("VPMOVSXBD Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 7 : 3);
+            GETGY();
+            if (vex.l) {
+                for (int i = 3; i >= 0; --i) {
+                    LB(x3, wback, fixedaddress + 4 + i);
+                    SW(x3, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 3; i >= 0; --i) {
+                LB(x3, wback, fixedaddress + i);
+                SW(x3, gback, gdoffset + i * 4);
+            }
+            break;
+        case 0x22:
+            INST_NAME("VPMOVSXBQ Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 3 : 1);
+            GETGY();
+            if (vex.l) {
+                for (int i = 1; i >= 0; --i) {
+                    LB(x3, wback, fixedaddress + 2 + i);
+                    SD(x3, gback, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 1; i >= 0; --i) {
+                LB(x3, wback, fixedaddress + i);
+                SD(x3, gback, gdoffset + i * 8);
+            }
+            break;
+        case 0x23:
+            INST_NAME("VPMOVSXWD Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 14 : 6);
+            GETGY();
+            if (vex.l) {
+                for (int i = 3; i >= 0; --i) {
+                    LH(x3, wback, fixedaddress + 8 + i * 2);
+                    SW(x3, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 3; i >= 0; --i) {
+                LH(x3, wback, fixedaddress + i * 2);
+                SW(x3, gback, gdoffset + i * 4);
+            }
+            break;
+        case 0x24:
+            INST_NAME("VPMOVSXWQ Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 6 : 2);
+            GETGY();
+            if (vex.l) {
+                for (int i = 1; i >= 0; --i) {
+                    LH(x3, wback, fixedaddress + 4 + i * 2);
+                    SD(x3, gback, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 1; i >= 0; --i) {
+                LH(x3, wback, fixedaddress + i * 2);
+                SD(x3, gback, gdoffset + i * 8);
+            }
+            break;
+        case 0x25:
+            INST_NAME("VPMOVSXDQ Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 12 : 4);
+            GETGY();
+            if (vex.l) {
+                for (int i = 1; i >= 0; --i) {
+                    LW(x4, wback, fixedaddress + 8 + i * 4);
+                    SD(x4, gback, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 1; i >= 0; --i) {
+                LW(x4, wback, fixedaddress + i * 4);
+                SD(x4, gback, gdoffset + i * 8);
+            }
+            break;
+        case 0x28:
+            INST_NAME("VPMULDQ Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            for (int i = 0; i < 2; ++i) {
+                LW(x3, vback, vxoffset + i * 8);
+                LW(x4, wback, fixedaddress + i * 8);
+                MUL(x3, x3, x4);
+                SD(x3, gback, gdoffset + i * 8);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 2; ++i) {
+                    LW(x3, vback, vyoffset + i * 8);
+                    LW(x4, wback, fixedaddress + i * 8);
+                    MUL(x3, x3, x4);
+                    SD(x3, gback, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x29:
+            INST_NAME("VPCMPEQQ Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            for (int i = 0; i < 2; ++i) {
+                LD(x4, vback, vxoffset + 8 * i);
+                LD(x5, wback, fixedaddress + 8 * i);
+                XOR(x4, x4, x5);
+                SLTIU(x4, x4, 1);
+                SUB(x4, xZR, x4);
+                SD(x4, gback, gdoffset + 8 * i);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 2; ++i) {
+                    LD(x4, vback, vyoffset + 8 * i);
+                    LD(x5, wback, fixedaddress + 8 * i);
+                    XOR(x4, x4, x5);
+                    SLTIU(x4, x4, 1);
+                    SUB(x4, xZR, x4);
+                    SD(x4, gback, gyoffset + 8 * i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x2A:
+            INST_NAME("VMOVNTDQA Gx, Ex");
+            nextop = F8;
+            if (MODREG) {
+                break;
+            }
+            GETGX();
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETGY();
+            LD(x4, wback, fixedaddress + 0);
+            SD(x4, gback, gdoffset + 0);
+            LD(x4, wback, fixedaddress + 8);
+            SD(x4, gback, gdoffset + 8);
+            if (vex.l) {
+                GETEY();
+                LD(x4, wback, fixedaddress + 0);
+                SD(x4, gback, gyoffset + 0);
+                LD(x4, wback, fixedaddress + 8);
+                SD(x4, gback, gyoffset + 8);
+            } else
+                YMM0(gd);
+            break;
+        case 0x2B:
+            INST_NAME("VPACKUSDW Gx, Vx, Ex");
+            nextop = F8;
+            GETVX();
+            GETVY();
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETGX();
+            GETGY();
+            LUI(x5, 0x10); // 65536
+            ADDIW(x5, x5, -1);
+            if (MODREG && ed == vex.v) {
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vxoffset + i * 4);
+                    SATUw(x3, x5);
+                    SH(x3, gback, gdoffset + i * 2);
+                }
+                LD(x3, gback, gdoffset);
+                SD(x3, gback, gdoffset + 8);
+            } else if (MODREG && gd == ed) {
+                for (int i = 3; i >= 0; --i) {
+                    LW(x3, wback, fixedaddress + i * 4);
+                    SATUw(x3, x5);
+                    SH(x3, gback, gdoffset + 8 + i * 2);
+                }
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vxoffset + i * 4);
+                    SATUw(x3, x5);
+                    SH(x3, gback, gdoffset + i * 2);
+                }
+            } else {
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vxoffset + i * 4);
+                    SATUw(x3, x5);
+                    SH(x3, gback, gdoffset + i * 2);
+                }
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, wback, fixedaddress + i * 4);
+                    SATUw(x3, x5);
+                    SH(x3, gback, gdoffset + 8 + i * 2);
+                }
+            }
+            if (vex.l) {
+                GETEY();
+                if (MODREG && ed == vex.v) {
+                    for (int i = 0; i < 4; ++i) {
+                        LW(x3, vback, vyoffset + i * 4);
+                        SATUw(x3, x5);
+                        SH(x3, gback, gyoffset + i * 2);
+                    }
+                    LD(x3, gback, gyoffset);
+                    SD(x3, gback, gyoffset + 8);
+                } else if (MODREG && gd == ed) {
+                    for (int i = 3; i >= 0; --i) {
+                        LW(x3, wback, fixedaddress + i * 4);
+                        SATUw(x3, x5);
+                        SH(x3, gback, gyoffset + 8 + i * 2);
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        LW(x3, vback, vyoffset + i * 4);
+                        SATUw(x3, x5);
+                        SH(x3, gback, gyoffset + i * 2);
+                    }
+                } else {
+                    for (int i = 0; i < 4; ++i) {
+                        LW(x3, vback, vyoffset + i * 4);
+                        SATUw(x3, x5);
+                        SH(x3, gback, gyoffset + i * 2);
+                    }
+                    for (int i = 0; i < 4; ++i) {
+                        LW(x3, wback, fixedaddress + i * 4);
+                        SATUw(x3, x5);
+                        SH(x3, gback, gyoffset + 8 + i * 2);
+                    }
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x2E:
+            INST_NAME("VMASKMOVPS Ex, Vx, Gx");
+            nextop = F8;
+            if (MODREG) return 0;
+            addr = geted(dyn, addr, ninst, nextop, &wback, x2, x1, &fixedaddress, rex, NULL, vex.l ? 24 : 8, 0);
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            for (int i = 0; i < 4; ++i) {
+                LW(x4, vback, vxoffset + 4 * i);
+                BGE(x4, xZR, 4 + 8);
+                LWU(x3, gback, gdoffset + 4 * i);
+                SW(x3, wback, fixedaddress + 4 * i);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LW(x4, vback, vyoffset + 4 * i);
+                    BGE(x4, xZR, 4 + 8);
+                    LWU(x3, gback, gyoffset + 4 * i);
+                    SW(x3, wback, fixedaddress + 4 * i);
+                }
+            }
+            SMWRITE2();
+            break;
+        case 0x30:
+            INST_NAME("VPMOVZXBW Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 15 : 7);
+            GETGY();
+            if (vex.l) {
+                for (int i = 7; i >= 0; --i) {
+                    LBU(x3, wback, fixedaddress + 8 + i);
+                    SH(x3, gback, gyoffset + i * 2);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 7; i >= 0; --i) {
+                LBU(x3, wback, fixedaddress + i);
+                SH(x3, gback, gdoffset + i * 2);
+            }
+            break;
+        case 0x31:
+            INST_NAME("VPMOVZXBD Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 7 : 3);
+            GETGY();
+            if (vex.l) {
+                for (int i = 3; i >= 0; --i) {
+                    LBU(x3, wback, fixedaddress + 4 + i);
+                    SW(x3, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 3; i >= 0; --i) {
+                LBU(x3, wback, fixedaddress + i);
+                SW(x3, gback, gdoffset + i * 4);
+            }
+            break;
+        case 0x32:
+            INST_NAME("VPMOVZXBQ Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 3 : 1);
+            GETGY();
+            if (vex.l) {
+                for (int i = 1; i >= 0; --i) {
+                    LBU(x3, wback, fixedaddress + 2 + i);
+                    SD(x3, gback, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 1; i >= 0; --i) {
+                LBU(x3, wback, fixedaddress + i);
+                SD(x3, gback, gdoffset + i * 8);
+            }
+            break;
+        case 0x33:
+            INST_NAME("VPMOVZXWD Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 14 : 6);
+            GETGY();
+            if (vex.l) {
+                for (int i = 3; i >= 0; --i) {
+                    LHU(x3, wback, fixedaddress + 8 + i * 2);
+                    SW(x3, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 3; i >= 0; --i) {
+                LHU(x3, wback, fixedaddress + i * 2);
+                SW(x3, gback, gdoffset + i * 4);
+            }
+            break;
+        case 0x34:
+            INST_NAME("VPMOVZXWQ Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 6 : 2);
+            GETGY();
+            if (vex.l) {
+                for (int i = 1; i >= 0; --i) {
+                    LHU(x3, wback, fixedaddress + 4 + i * 2);
+                    SD(x3, gback, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 1; i >= 0; --i) {
+                LHU(x3, wback, fixedaddress + i * 2);
+                SD(x3, gback, gdoffset + i * 8);
+            }
+            break;
+        case 0x35:
+            INST_NAME("VPMOVZXDQ Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 12 : 4);
+            GETGY();
+            if (vex.l) {
+                for (int i = 1; i >= 0; --i) {
+                    LWU(x4, wback, fixedaddress + 8 + i * 4);
+                    SD(x4, gback, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            for (int i = 1; i >= 0; --i) {
+                LWU(x4, wback, fixedaddress + i * 4);
+                SD(x4, gback, gdoffset + i * 8);
+            }
+            break;
+        case 0x36:
+            if (!vex.l) return 0;
+            INST_NAME("VPERMD Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x1, 0, 28);
+            GETGX();
+            GETVX();
+            GETGY();
+            GETVY();
+            if (MODREG) {
+                ADDI(x6, xEmu, offsetof(x64emu_t, scratch));
+                LD(x3, wback, fixedaddress + 0);
+                LD(x4, wback, fixedaddress + 8);
+                SD(x3, x6, 0);
+                SD(x4, x6, 8);
+                LD(x3, wback, fixedaddress + offsetof(x64emu_t, ymm) - offsetof(x64emu_t, xmm));
+                LD(x4, wback, fixedaddress + offsetof(x64emu_t, ymm) - offsetof(x64emu_t, xmm) + 8);
+                SD(x3, x6, 16);
+                SD(x4, x6, 24);
+                wback = x6;
+                fixedaddress = 0;
+            }
+            if (gd == vex.v) {
+                ADDI(x7, xEmu, offsetof(x64emu_t, scratch) + 32);
+                LD(x3, vback, vxoffset + 0);
+                LD(x4, vback, vxoffset + 8);
+                SD(x3, x7, 0);
+                SD(x4, x7, 8);
+                LD(x3, xEmu, vyoffset + 0);
+                LD(x4, xEmu, vyoffset + 8);
+                SD(x3, x7, 16);
+                SD(x4, x7, 24);
+                vback = x7;
+                vxoffset = 0;
+                vyoffset = 16;
+            }
+            for (int i = 0; i < 4; ++i) {
+                LWU(x3, vback, vxoffset + 4 * i);
+                ANDI(x3, x3, 7);
+                ADDSL(x4, wback, x3, 2, x3);
+                LWU(x5, x4, fixedaddress);
+                SW(x5, gback, gdoffset + 4 * i);
+            }
+            for (int i = 0; i < 4; ++i) {
+                LWU(x3, vback, vyoffset + 4 * i);
+                ANDI(x3, x3, 7);
+                ADDSL(x4, wback, x3, 2, x3);
+                LWU(x5, x4, fixedaddress);
+                SW(x5, gback, gyoffset + 4 * i);
+            }
+            break;
+        case 0x38:
+            INST_NAME("VPMINSB Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 31 : 15);
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 16; ++i) {
+                LB(x3, vback, vxoffset + i);
+                LB(x4, wback, fixedaddress + i);
+                if (cpuext.zbb)
+                    MIN(x4, x3, x4);
+                else {
+                    BLT(x4, x3, 4 + 4);
+                    MV(x4, x3);
+                }
+                SB(x4, gback, gdoffset + i);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 16; ++i) {
+                    LB(x3, vback, vyoffset + i);
+                    LB(x4, wback, fixedaddress + i);
+                    if (cpuext.zbb)
+                        MIN(x4, x3, x4);
+                    else {
+                        BLT(x4, x3, 4 + 4);
+                        MV(x4, x3);
+                    }
+                    SB(x4, gback, gyoffset + i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x39:
+            INST_NAME("VPMINSD Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 4; ++i) {
+                LW(x3, vback, vxoffset + i * 4);
+                LW(x4, wback, fixedaddress + i * 4);
+                if (cpuext.zbb)
+                    MIN(x4, x3, x4);
+                else {
+                    BLT(x4, x3, 4 + 4);
+                    MV(x4, x3);
+                }
+                SW(x4, gback, gdoffset + i * 4);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vyoffset + i * 4);
+                    LW(x4, wback, fixedaddress + i * 4);
+                    if (cpuext.zbb)
+                        MIN(x4, x3, x4);
+                    else {
+                        BLT(x4, x3, 4 + 4);
+                        MV(x4, x3);
+                    }
+                    SW(x4, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x3A:
+            INST_NAME("VPMINUW Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 30 : 14);
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 8; ++i) {
+                LHU(x3, vback, vxoffset + i * 2);
+                LHU(x4, wback, fixedaddress + i * 2);
+                if (cpuext.zbb)
+                    MINU(x4, x3, x4);
+                else {
+                    BLTU(x4, x3, 4 + 4);
+                    MV(x4, x3);
+                }
+                SH(x4, gback, gdoffset + i * 2);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 8; ++i) {
+                    LHU(x3, vback, vyoffset + i * 2);
+                    LHU(x4, wback, fixedaddress + i * 2);
+                    if (cpuext.zbb)
+                        MINU(x4, x3, x4);
+                    else {
+                        BLTU(x4, x3, 4 + 4);
+                        MV(x4, x3);
+                    }
+                    SH(x4, gback, gyoffset + i * 2);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x3B:
+            INST_NAME("VPMINUD Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 4; ++i) {
+                LWU(x3, vback, vxoffset + i * 4);
+                LWU(x4, wback, fixedaddress + i * 4);
+                if (cpuext.zbb)
+                    MINU(x4, x3, x4);
+                else {
+                    BLTU(x4, x3, 4 + 4);
+                    MV(x4, x3);
+                }
+                SW(x4, gback, gdoffset + i * 4);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LWU(x3, vback, vyoffset + i * 4);
+                    LWU(x4, wback, fixedaddress + i * 4);
+                    if (cpuext.zbb)
+                        MINU(x4, x3, x4);
+                    else {
+                        BLTU(x4, x3, 4 + 4);
+                        MV(x4, x3);
+                    }
+                    SW(x4, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x3C:
+            INST_NAME("VPMAXSB Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 31 : 15);
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 16; ++i) {
+                LB(x3, vback, vxoffset + i * 1);
+                LB(x4, wback, fixedaddress + i * 1);
+                if (cpuext.zbb)
+                    MAX(x4, x3, x4);
+                else {
+                    BLT(x3, x4, 4 + 4);
+                    MV(x4, x3);
+                }
+                SB(x4, gback, gdoffset + i * 1);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 16; ++i) {
+                    LB(x3, vback, vyoffset + i * 1);
+                    LB(x4, wback, fixedaddress + i * 1);
+                    if (cpuext.zbb)
+                        MAX(x4, x3, x4);
+                    else {
+                        BLT(x3, x4, 4 + 4);
+                        MV(x4, x3);
+                    }
+                    SB(x4, gback, gyoffset + i * 1);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x3D:
+            INST_NAME("VPMAXSD Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 4; ++i) {
+                LW(x3, vback, vxoffset + i * 4);
+                LW(x4, wback, fixedaddress + i * 4);
+                if (cpuext.zbb)
+                    MAX(x4, x3, x4);
+                else {
+                    BLT(x3, x4, 4 + 4);
+                    MV(x4, x3);
+                }
+                SW(x4, gback, gdoffset + i * 4);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vyoffset + i * 4);
+                    LW(x4, wback, fixedaddress + i * 4);
+                    if (cpuext.zbb)
+                        MAX(x4, x3, x4);
+                    else {
+                        BLT(x3, x4, 4 + 4);
+                        MV(x4, x3);
+                    }
+                    SW(x4, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x3E:
+            INST_NAME("VPMAXUW Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 30 : 14);
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 8; ++i) {
+                LHU(x3, vback, vxoffset + i * 2);
+                LHU(x4, wback, fixedaddress + i * 2);
+                if (cpuext.zbb)
+                    MAXU(x4, x3, x4);
+                else {
+                    BLTU(x3, x4, 4 + 4);
+                    MV(x4, x3);
+                }
+                SH(x4, gback, gdoffset + i * 2);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 8; ++i) {
+                    LHU(x3, vback, vyoffset + i * 2);
+                    LHU(x4, wback, fixedaddress + i * 2);
+                    if (cpuext.zbb)
+                        MAXU(x4, x3, x4);
+                    else {
+                        BLTU(x3, x4, 4 + 4);
+                        MV(x4, x3);
+                    }
+                    SH(x4, gback, gyoffset + i * 2);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x3F:
+            INST_NAME("VPMAXUD Gx, Vx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETGY();
+            GETVY();
+            for (int i = 0; i < 4; ++i) {
+                LWU(x3, vback, vxoffset + i * 4);
+                LWU(x4, wback, fixedaddress + i * 4);
+                if (cpuext.zbb)
+                    MAXU(x4, x3, x4);
+                else {
+                    BLTU(x3, x4, 4 + 4);
+                    MV(x4, x3);
+                }
+                SW(x4, gback, gdoffset + i * 4);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LWU(x3, vback, vyoffset + i * 4);
+                    LWU(x4, wback, fixedaddress + i * 4);
+                    if (cpuext.zbb)
+                        MAXU(x4, x3, x4);
+                    else {
+                        BLTU(x3, x4, 4 + 4);
+                        MV(x4, x3);
+                    }
+                    SW(x4, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x37:
+            INST_NAME("VPCMPGTQ Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, vback, vxoffset + 8 * i);
+                LD(x4, wback, fixedaddress + 8 * i);
+                SLT(x5, x4, x3);
+                SUB(x4, xZR, x5);
+                SD(x4, gback, gdoffset + 8 * i);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, vback, vyoffset + 8 * i);
+                    LD(x4, wback, fixedaddress + 8 * i);
+                    SLT(x5, x4, x3);
+                    SUB(x4, xZR, x5);
+                    SD(x4, gback, gyoffset + 8 * i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x40:
+            INST_NAME("VPMULLD Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            for (int i = 0; i < 4; ++i) {
+                LW(x3, vback, vxoffset + i * 4);
+                LW(x4, wback, fixedaddress + i * 4);
+                MUL(x3, x3, x4);
+                SW(x3, gback, gdoffset + i * 4);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vyoffset + i * 4);
+                    LW(x4, wback, fixedaddress + i * 4);
+                    MUL(x3, x3, x4);
+                    SW(x3, gback, gyoffset + i * 4);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x41:
+            if (vex.l) return 0;
+            INST_NAME("VPHMINPOSUW Gx, Ex");
+            nextop = F8;
+            GETEX(x2, 0, 14);
+            GETGX();
+            MOV32w(x6, 0xffff);
+            ADDI(x7, xZR, 0);
+            for (int i = 0; i < 8; ++i) {
+                LHU(x3, wback, fixedaddress + 2 * i);
+                SLTU(x4, x3, x6);
+                NEG(x4, x4);
+                NOT(x5, x4);
+                AND(x6, x6, x5);
+                AND(x7, x7, x5);
+                AND(x3, x3, x4);
+                OR(x6, x6, x3);
+                ADDI(x3, xZR, i);
+                AND(x3, x3, x4);
+                OR(x7, x7, x3);
+            }
+            SLLI(x7, x7, 16);
+            OR(x6, x6, x7);
+            SW(x6, gback, gdoffset + 0);
+            SW(xZR, gback, gdoffset + 4);
+            SD(xZR, gback, gdoffset + 8);
+            YMM0(gd);
+            break;
+        case 0x45:
+            if (rex.w) {
+                INST_NAME("VPSRLVQ Gx, Vx, Ex");
+            } else {
+                INST_NAME("VPSRLVD Gx, Vx, Ex");
+            }
+            nextop = F8;
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            if (rex.w) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x4, vback, vxoffset + 8 * i);
+                    LD(x5, wback, fixedaddress + 8 * i);
+                    SLTIU(x6, x5, 64);
+                    SRL(x7, x4, x5);
+                    SUB(x6, xZR, x6);
+                    AND(x7, x7, x6);
+                    SD(x7, gback, gdoffset + 8 * i);
+                }
+                if (vex.l) {
+                    GETEY();
+                    for (int i = 0; i < 2; ++i) {
+                        LD(x4, vback, vyoffset + 8 * i);
+                        LD(x5, wback, fixedaddress + 8 * i);
+                        SLTIU(x6, x5, 64);
+                        SRL(x7, x4, x5);
+                        SUB(x6, xZR, x6);
+                        AND(x7, x7, x6);
+                        SD(x7, gback, gyoffset + 8 * i);
+                    }
+                } else
+                    YMM0(gd);
+            } else {
+                for (int i = 0; i < 4; ++i) {
+                    LWU(x4, vback, vxoffset + 4 * i);
+                    LWU(x5, wback, fixedaddress + 4 * i);
+                    SLTIU(x6, x5, 32);
+                    SRL(x7, x4, x5);
+                    SUB(x6, xZR, x6);
+                    AND(x7, x7, x6);
+                    SW(x7, gback, gdoffset + 4 * i);
+                }
+                if (vex.l) {
+                    GETEY();
+                    for (int i = 0; i < 4; ++i) {
+                        LWU(x4, vback, vyoffset + 4 * i);
+                        LWU(x5, wback, fixedaddress + 4 * i);
+                        SLTIU(x6, x5, 32);
+                        SRL(x7, x4, x5);
+                        SUB(x6, xZR, x6);
+                        AND(x7, x7, x6);
+                        SW(x7, gback, gyoffset + 4 * i);
+                    }
+                } else
+                    YMM0(gd);
+            }
+            break;
+        case 0x46:
+            INST_NAME("VPSRAVD Gx, Vx, Ex");
+            nextop = F8;
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            for (int i = 0; i < 4; ++i) {
+                LW(x4, vback, vxoffset + 4 * i);
+                LWU(x5, wback, fixedaddress + 4 * i);
+                ADDI(x6, xZR, 31);
+                if (cpuext.zbb) {
+                    MINU(x5, x5, x6);
+                } else {
+                    BLTU(x5, x6, 4 + 4);
+                    MV(x5, x6);
+                }
+                SRAW(x7, x4, x5);
+                SW(x7, gback, gdoffset + 4 * i);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 4; ++i) {
+                    LW(x4, vback, vyoffset + 4 * i);
+                    LWU(x5, wback, fixedaddress + 4 * i);
+                    ADDI(x6, xZR, 31);
+                    if (cpuext.zbb) {
+                        MINU(x5, x5, x6);
+                    } else {
+                        BLTU(x5, x6, 4 + 4);
+                        MV(x5, x6);
+                    }
+                    SRAW(x7, x4, x5);
+                    SW(x7, gback, gyoffset + 4 * i);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0x47:
+            if (rex.w) {
+                INST_NAME("VPSLLVQ Gx, Vx, Ex");
+            } else {
+                INST_NAME("VPSLLVD Gx, Vx, Ex");
+            }
+            nextop = F8;
+            GETEX(x2, 0, vex.l ? 28 : 12);
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            if (rex.w) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x4, vback, vxoffset + 8 * i);
+                    LD(x5, wback, fixedaddress + 8 * i);
+                    SLTIU(x6, x5, 64);
+                    SLL(x7, x4, x5);
+                    SUB(x6, xZR, x6);
+                    AND(x7, x7, x6);
+                    SD(x7, gback, gdoffset + 8 * i);
+                }
+                if (vex.l) {
+                    GETEY();
+                    for (int i = 0; i < 2; ++i) {
+                        LD(x4, vback, vyoffset + 8 * i);
+                        LD(x5, wback, fixedaddress + 8 * i);
+                        SLTIU(x6, x5, 64);
+                        SLL(x7, x4, x5);
+                        SUB(x6, xZR, x6);
+                        AND(x7, x7, x6);
+                        SD(x7, gback, gyoffset + 8 * i);
+                    }
+                } else
+                    YMM0(gd);
+            } else {
+                for (int i = 0; i < 4; ++i) {
+                    LWU(x4, vback, vxoffset + 4 * i);
+                    LWU(x5, wback, fixedaddress + 4 * i);
+                    SLTIU(x6, x5, 32);
+                    SLL(x7, x4, x5);
+                    SUB(x6, xZR, x6);
+                    AND(x7, x7, x6);
+                    SW(x7, gback, gdoffset + 4 * i);
+                }
+                if (vex.l) {
+                    GETEY();
+                    for (int i = 0; i < 4; ++i) {
+                        LWU(x4, vback, vyoffset + 4 * i);
+                        LWU(x5, wback, fixedaddress + 4 * i);
+                        SLTIU(x6, x5, 32);
+                        SLL(x7, x4, x5);
+                        SUB(x6, xZR, x6);
+                        AND(x7, x7, x6);
+                        SW(x7, gback, gyoffset + 4 * i);
+                    }
+                } else
+                    YMM0(gd);
+            }
+            break;
+        case 0x58:
+            INST_NAME("VPBROADCASTD Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, 1);
+            LWU(x4, wback, fixedaddress);
+            SLLI(x5, x4, 32);
+            OR(x4, x4, x5);
+            SD(x4, gback, gdoffset);
+            SD(x4, gback, gdoffset + 8);
+            if (vex.l) {
+                GETGY();
+                SD(x4, gback, gyoffset);
+                SD(x4, gback, gyoffset + 8);
+            } else {
+                YMM0(gd);
+            }
+            break;
+        case 0x59:
+            INST_NAME("VPBROADCASTQ Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, 1);
+            LD(x4, wback, fixedaddress);
+            SD(x4, gback, gdoffset);
+            SD(x4, gback, gdoffset + 8);
+            if (vex.l) {
+                GETGY();
+                SD(x4, gback, gyoffset);
+                SD(x4, gback, gyoffset + 8);
+            } else {
+                YMM0(gd);
+            }
+            break;
+        case 0x5A:
+            INST_NAME("VBROADCASTI128 Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, 8);
+            GETGY();
+            if (!vex.l || MODREG) UDF();
+            LD(x4, wback, fixedaddress);
+            LD(x5, wback, fixedaddress + 8);
+            SD(x4, gback, gdoffset);
+            SD(x5, gback, gdoffset + 8);
+            SD(x4, gback, gyoffset);
+            SD(x5, gback, gyoffset + 8);
+            break;
+        case 0x78:
+            INST_NAME("VPBROADCASTB Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, 1);
+            LBU(x4, wback, fixedaddress);
+            SLLI(x5, x4, 8);
+            OR(x4, x4, x5);
+            SLLI(x5, x4, 16);
+            OR(x4, x4, x5);
+            SLLI(x5, x4, 32);
+            OR(x4, x4, x5);
+            SD(x4, gback, gdoffset);
+            SD(x4, gback, gdoffset + 8);
+            if (vex.l) {
+                GETGY();
+                SD(x4, gback, gyoffset);
+                SD(x4, gback, gyoffset + 8);
+            } else {
+                YMM0(gd);
+            }
+            break;
+        case 0x79:
+            INST_NAME("VPBROADCASTW Gx, Ex");
+            nextop = F8;
+            GETGX();
+            GETEX(x2, 0, 1);
+            LHU(x4, wback, fixedaddress);
+            SLLI(x5, x4, 16);
+            OR(x4, x4, x5);
+            SLLI(x5, x4, 32);
+            OR(x4, x4, x5);
+            SD(x4, gback, gdoffset);
+            SD(x4, gback, gdoffset + 8);
+            if (vex.l) {
+                GETGY();
+                SD(x4, gback, gyoffset);
+                SD(x4, gback, gyoffset + 8);
+            } else {
+                YMM0(gd);
+            }
+            break;
+        case 0x8C:
+            INST_NAME("VPMASKMOVD/Q Gx, Vx, Ex");
+            nextop = F8;
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            if (rex.w) {
+                GETEX(x2, 0, vex.l ? 28 : 12);
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, vback, vxoffset + 8 * i);
+                    MV(x4, xZR);
+                    BGE(x3, xZR, 4 + 4);
+                    LD(x4, wback, fixedaddress + 8 * i);
+                    SD(x4, gback, gdoffset + 8 * i);
+                }
+                if (vex.l) {
+                    GETEY();
+                    for (int i = 0; i < 2; ++i) {
+                        LD(x3, vback, vyoffset + 8 * i);
+                        MV(x4, xZR);
+                        BGE(x3, xZR, 4 + 4);
+                        LD(x4, wback, fixedaddress + 8 * i);
+                        SD(x4, gback, gyoffset + 8 * i);
+                    }
+                } else
+                    YMM0(gd);
+            } else {
+                GETEX(x2, 0, vex.l ? 28 : 12);
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vxoffset + 4 * i);
+                    MV(x4, xZR);
+                    BGE(x3, xZR, 4 + 4);
+                    LWU(x4, wback, fixedaddress + 4 * i);
+                    SW(x4, gback, gdoffset + 4 * i);
+                }
+                if (vex.l) {
+                    GETEY();
+                    for (int i = 0; i < 4; ++i) {
+                        LW(x3, vback, vyoffset + 4 * i);
+                        MV(x4, xZR);
+                        BGE(x3, xZR, 4 + 4);
+                        LWU(x4, wback, fixedaddress + 4 * i);
+                        SW(x4, gback, gyoffset + 4 * i);
+                    }
+                } else
+                    YMM0(gd);
+            }
+            break;
+        case 0x8E:
+            INST_NAME("VPMASKMOVD/Q Ex, Vx, Gx");
+            nextop = F8;
+            GETVX();
+            GETVY();
+            GETGX();
+            GETGY();
+            if (rex.w) {
+                GETEX(x2, 0, vex.l ? 28 : 12);
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, vback, vxoffset + 8 * i);
+                    BGE(x3, xZR, 4 + 8);
+                    LD(x4, gback, gdoffset + 8 * i);
+                    SD(x4, wback, fixedaddress + 8 * i);
+                }
+                if (vex.l) {
+                    GETEY();
+                    for (int i = 0; i < 2; ++i) {
+                        LD(x3, vback, vyoffset + 8 * i);
+                        BGE(x3, xZR, 4 + 8);
+                        LD(x4, gback, gyoffset + 8 * i);
+                        SD(x4, wback, fixedaddress + 8 * i);
+                    }
+                }
+                SMWRITE2();
+            } else {
+                GETEX(x2, 0, vex.l ? 28 : 12);
+                for (int i = 0; i < 4; ++i) {
+                    LW(x3, vback, vxoffset + 4 * i);
+                    BGE(x3, xZR, 4 + 8);
+                    LW(x4, gback, gdoffset + 4 * i);
+                    SW(x4, wback, fixedaddress + 4 * i);
+                }
+                if (vex.l) {
+                    GETEY();
+                    for (int i = 0; i < 4; ++i) {
+                        LW(x3, vback, vyoffset + 4 * i);
+                        BGE(x3, xZR, 4 + 8);
+                        LW(x4, gback, gyoffset + 4 * i);
+                        SW(x4, wback, fixedaddress + 4 * i);
+                    }
+                }
+                SMWRITE2();
+            }
+            break;
+        case 0xDC:
+            INST_NAME("VAESENC Gx, Vx, Ex");
+            nextop = F8;
+            if (cpuext.zvkned && cpuext.vlen >= 32) {
+                gd = ((nextop & 0x38) >> 3) + (rex.r << 3);
+                SET_AVX_VECTOR_WIDTH(x1, VECTOR_SEW32);
+                v0 = fpu_get_scratch(dyn);
+                avx_load_reg_vector(dyn, ninst, x1, v0, vex.v, 16 << vex.l, VECTOR_SEW32);
+                v1 = fpu_get_scratch(dyn);
+                if (MODREG) {
+                    avx_load_reg_vector(dyn, ninst, x1, v1, (nextop & 7) + (rex.b << 3), 16 << vex.l, VECTOR_SEW32);
+                } else {
+                    SMREAD();
+                    addr = geted(dyn, addr, ninst, nextop, &ed, x3, x2, &fixedaddress, rex, NULL, 0, 0);
+                    VLE32_V(v1, ed, VECTOR_UNMASKED, VECTOR_NFIELD1);
+                }
+                VAESEM_VV(v0, v1);
+                avx_store_reg_vector(dyn, ninst, x1, v0, gd, 16 << vex.l, VECTOR_SEW32);
+                break;
+            }
+            GETGX();
+            GETVX();
+            if (vex.l) {
+                GETGY();
+                GETVY();
+            }
+            GETEX(x2, 0, vex.l ? 30 : 14);
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, wback, fixedaddress + i * 8);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + i * 8);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, wback, fixedaddress + i * 8);
+                    SD(x3, xEmu, offsetof(x64emu_t, scratch) + 16 + i * 8);
+                }
+            }
+            if (gd != vex.v) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, vback, vxoffset + i * 8);
+                    SD(x3, xEmu, gdoffset + i * 8);
+                }
+                if (vex.l) {
+                    for (int i = 0; i < 2; ++i) {
+                        LD(x3, vback, vyoffset + i * 8);
+                        SD(x3, xEmu, gyoffset + i * 8);
+                    }
+                }
+            }
+            MOV32w(x1, gd);
+            CALL(const_native_aese, -1, x1, 0);
+            if (vex.l) {
+                MOV32w(x1, gd);
+                CALL(const_native_aese_y, -1, x1, 0);
+            }
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, xEmu, gdoffset + i * 8);
+                LD(x4, xEmu, offsetof(x64emu_t, scratch) + i * 8);
+                XOR(x3, x3, x4);
+                SD(x3, xEmu, gdoffset + i * 8);
+            }
+            if (vex.l) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, xEmu, gyoffset + i * 8);
+                    LD(x4, xEmu, offsetof(x64emu_t, scratch) + 16 + i * 8);
+                    XOR(x3, x3, x4);
+                    SD(x3, xEmu, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0xDD:
+            INST_NAME("VAESENCLAST Gx, Vx, Ex");
+            nextop = F8;
+            if (cpuext.zvkned && cpuext.vlen >= 32) {
+                gd = ((nextop & 0x38) >> 3) + (rex.r << 3);
+                SET_AVX_VECTOR_WIDTH(x1, VECTOR_SEW32);
+                v0 = fpu_get_scratch(dyn);
+                avx_load_reg_vector(dyn, ninst, x1, v0, vex.v, 16 << vex.l, VECTOR_SEW32);
+                v1 = fpu_get_scratch(dyn);
+                if (MODREG) {
+                    avx_load_reg_vector(dyn, ninst, x1, v1, (nextop & 7) + (rex.b << 3), 16 << vex.l, VECTOR_SEW32);
+                } else {
+                    SMREAD();
+                    addr = geted(dyn, addr, ninst, nextop, &ed, x3, x2, &fixedaddress, rex, NULL, 0, 0);
+                    VLE32_V(v1, ed, VECTOR_UNMASKED, VECTOR_NFIELD1);
+                }
+                VAESEF_VV(v0, v1);
+                avx_store_reg_vector(dyn, ninst, x1, v0, gd, 16 << vex.l, VECTOR_SEW32);
+                break;
+            }
+            GETGX();
+            GETVX();
+            if (vex.l) {
+                GETGY();
+                GETVY();
+            }
+            GETEX(x2, 0, vex.l ? 30 : 14);
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, wback, fixedaddress + i * 8);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + i * 8);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, wback, fixedaddress + i * 8);
+                    SD(x3, xEmu, offsetof(x64emu_t, scratch) + 16 + i * 8);
+                }
+            }
+            if (gd != vex.v) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, vback, vxoffset + i * 8);
+                    SD(x3, xEmu, gdoffset + i * 8);
+                }
+                if (vex.l) {
+                    for (int i = 0; i < 2; ++i) {
+                        LD(x3, vback, vyoffset + i * 8);
+                        SD(x3, xEmu, gyoffset + i * 8);
+                    }
+                }
+            }
+            MOV32w(x1, gd);
+            CALL(const_native_aeselast, -1, x1, 0);
+            if (vex.l) {
+                MOV32w(x1, gd);
+                CALL(const_native_aeselast_y, -1, x1, 0);
+            }
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, xEmu, gdoffset + i * 8);
+                LD(x4, xEmu, offsetof(x64emu_t, scratch) + i * 8);
+                XOR(x3, x3, x4);
+                SD(x3, xEmu, gdoffset + i * 8);
+            }
+            if (vex.l) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, xEmu, gyoffset + i * 8);
+                    LD(x4, xEmu, offsetof(x64emu_t, scratch) + 16 + i * 8);
+                    XOR(x3, x3, x4);
+                    SD(x3, xEmu, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0xDB:
+            INST_NAME("VAESIMC Gx, Ex");
+            nextop = F8;
+            if (vex.l) {
+                DEFAULT;
+            }
+            if (cpuext.zvkned && cpuext.vlen >= 32) {
+                gd = ((nextop & 0x38) >> 3) + (rex.r << 3);
+                SET_AVX_VECTOR_WIDTH(x1, VECTOR_SEW32);
+                v1 = fpu_get_scratch(dyn);
+                if (MODREG) {
+                    avx_load_reg_vector(dyn, ninst, x1, v1, (nextop & 7) + (rex.b << 3), 16, VECTOR_SEW32);
+                } else {
+                    SMREAD();
+                    addr = geted(dyn, addr, ninst, nextop, &ed, x3, x2, &fixedaddress, rex, NULL, 0, 0);
+                    VLE32_V(v1, ed, VECTOR_UNMASKED, VECTOR_NFIELD1);
+                }
+                v2 = fpu_get_scratch(dyn);
+                MOV32w(x4, 0x63636363);
+                VMV_V_X(v2, x4);
+                VAESDM_VV(v2, v1);
+                avx_store_reg_vector(dyn, ninst, x1, v2, gd, 16, VECTOR_SEW32);
+                break;
+            }
+            GETGX();
+            GETEX(x2, 0, 14);
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, wback, fixedaddress + i * 8);
+                SD(x3, gback, gdoffset + i * 8);
+            }
+            sse_forget_reg(dyn, ninst, x6, gd);
+            MOV32w(x1, gd);
+            CALL(const_native_aesimc, -1, x1, 0);
+            YMM0(gd);
+            break;
+        case 0xDE:
+            INST_NAME("VAESDEC Gx, Vx, Ex");
+            nextop = F8;
+            if (cpuext.zvkned && cpuext.vlen >= 32) {
+                gd = ((nextop & 0x38) >> 3) + (rex.r << 3);
+                SET_AVX_VECTOR_WIDTH(x1, VECTOR_SEW32);
+                v0 = fpu_get_scratch(dyn);
+                avx_load_reg_vector(dyn, ninst, x1, v0, vex.v, 16 << vex.l, VECTOR_SEW32);
+                v1 = fpu_get_scratch(dyn);
+                if (MODREG) {
+                    avx_load_reg_vector(dyn, ninst, x1, v1, (nextop & 7) + (rex.b << 3), 16 << vex.l, VECTOR_SEW32);
+                } else {
+                    SMREAD();
+                    addr = geted(dyn, addr, ninst, nextop, &ed, x3, x2, &fixedaddress, rex, NULL, 0, 0);
+                    VLE32_V(v1, ed, VECTOR_UNMASKED, VECTOR_NFIELD1);
+                }
+                v2 = fpu_get_scratch(dyn);
+                VXOR_VV(v2, v2, v2, 1);
+                VAESDF_VV(v0, v2);
+                v2 = fpu_get_scratch(dyn);
+                MOV32w(x4, 0x63636363);
+                VMV_V_X(v2, x4);
+                VAESDM_VV(v2, v0);
+                VXOR_VV(v0, v2, v1, 1);
+                avx_store_reg_vector(dyn, ninst, x1, v0, gd, 16 << vex.l, VECTOR_SEW32);
+                break;
+            }
+            GETGX();
+            GETVX();
+            if (vex.l) {
+                GETGY();
+                GETVY();
+            }
+            GETEX(x2, 0, vex.l ? 30 : 14);
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, wback, fixedaddress + i * 8);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + i * 8);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, wback, fixedaddress + i * 8);
+                    SD(x3, xEmu, offsetof(x64emu_t, scratch) + 16 + i * 8);
+                }
+            }
+            if (gd != vex.v) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, vback, vxoffset + i * 8);
+                    SD(x3, xEmu, gdoffset + i * 8);
+                }
+                if (vex.l) {
+                    for (int i = 0; i < 2; ++i) {
+                        LD(x3, vback, vyoffset + i * 8);
+                        SD(x3, xEmu, gyoffset + i * 8);
+                    }
+                }
+            }
+            MOV32w(x1, gd);
+            CALL(const_native_aesd, -1, x1, 0);
+            if (vex.l) {
+                MOV32w(x1, gd);
+                CALL(const_native_aesd_y, -1, x1, 0);
+            }
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, xEmu, gdoffset + i * 8);
+                LD(x4, xEmu, offsetof(x64emu_t, scratch) + i * 8);
+                XOR(x3, x3, x4);
+                SD(x3, xEmu, gdoffset + i * 8);
+            }
+            if (vex.l) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, xEmu, gyoffset + i * 8);
+                    LD(x4, xEmu, offsetof(x64emu_t, scratch) + 16 + i * 8);
+                    XOR(x3, x3, x4);
+                    SD(x3, xEmu, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0xDF:
+            INST_NAME("VAESDECLAST Gx, Vx, Ex");
+            nextop = F8;
+            if (cpuext.zvkned && cpuext.vlen >= 32) {
+                gd = ((nextop & 0x38) >> 3) + (rex.r << 3);
+                SET_AVX_VECTOR_WIDTH(x1, VECTOR_SEW32);
+                v0 = fpu_get_scratch(dyn);
+                avx_load_reg_vector(dyn, ninst, x1, v0, vex.v, 16 << vex.l, VECTOR_SEW32);
+                v1 = fpu_get_scratch(dyn);
+                if (MODREG) {
+                    avx_load_reg_vector(dyn, ninst, x1, v1, (nextop & 7) + (rex.b << 3), 16 << vex.l, VECTOR_SEW32);
+                } else {
+                    SMREAD();
+                    addr = geted(dyn, addr, ninst, nextop, &ed, x3, x2, &fixedaddress, rex, NULL, 0, 0);
+                    VLE32_V(v1, ed, VECTOR_UNMASKED, VECTOR_NFIELD1);
+                }
+                VAESDF_VV(v0, v1);
+                avx_store_reg_vector(dyn, ninst, x1, v0, gd, 16 << vex.l, VECTOR_SEW32);
+                break;
+            }
+            GETGX();
+            GETVX();
+            if (vex.l) {
+                GETGY();
+                GETVY();
+            }
+            GETEX(x2, 0, vex.l ? 30 : 14);
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, wback, fixedaddress + i * 8);
+                SD(x3, xEmu, offsetof(x64emu_t, scratch) + i * 8);
+            }
+            if (vex.l) {
+                GETEY();
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, wback, fixedaddress + i * 8);
+                    SD(x3, xEmu, offsetof(x64emu_t, scratch) + 16 + i * 8);
+                }
+            }
+            if (gd != vex.v) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, vback, vxoffset + i * 8);
+                    SD(x3, xEmu, gdoffset + i * 8);
+                }
+                if (vex.l) {
+                    for (int i = 0; i < 2; ++i) {
+                        LD(x3, vback, vyoffset + i * 8);
+                        SD(x3, xEmu, gyoffset + i * 8);
+                    }
+                }
+            }
+            MOV32w(x1, gd);
+            CALL(const_native_aesdlast, -1, x1, 0);
+            if (vex.l) {
+                MOV32w(x1, gd);
+                CALL(const_native_aesdlast_y, -1, x1, 0);
+            }
+            for (int i = 0; i < 2; ++i) {
+                LD(x3, xEmu, gdoffset + i * 8);
+                LD(x4, xEmu, offsetof(x64emu_t, scratch) + i * 8);
+                XOR(x3, x3, x4);
+                SD(x3, xEmu, gdoffset + i * 8);
+            }
+            if (vex.l) {
+                for (int i = 0; i < 2; ++i) {
+                    LD(x3, xEmu, gyoffset + i * 8);
+                    LD(x4, xEmu, offsetof(x64emu_t, scratch) + 16 + i * 8);
+                    XOR(x3, x3, x4);
+                    SD(x3, xEmu, gyoffset + i * 8);
+                }
+            } else
+                YMM0(gd);
+            break;
+        case 0xF7:
+            INST_NAME("SHLX Gd, Ed, Vd");
+            nextop = F8;
+            GETGDd;
+            GETED(0);
+            GETVD;
+            ANDI(x5, vd, rex.w ? 0x3f : 0x1f);
+            SLLxw(gd, ed, x5);
+            break;
+        default:
+            DEFAULT;
+    }
+    return addr;
+}

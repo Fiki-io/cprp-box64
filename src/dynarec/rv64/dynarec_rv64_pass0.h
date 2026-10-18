@@ -1,0 +1,128 @@
+// SPDX-License-Identifier: MIT
+
+#define INIT uintptr_t sav_addr = addr
+#define FINI                           \
+    dyn->isize = addr - sav_addr;      \
+    dyn->insts[ninst].x64.addr = addr; \
+    if (ninst) dyn->insts[ninst - 1].x64.size = dyn->insts[ninst].x64.addr - dyn->insts[ninst - 1].x64.addr
+
+#define MESSAGE(A, ...) \
+    do {                \
+    } while (0)
+#define READFLAGS(A)                                                                        \
+    do {                                                                                    \
+        dyn->insts[ninst].x64.use_flags = A;                                                \
+        if (!BOX64ENV(dynarec_df) && (A) & X_PEND) dyn->insts[ninst].x64.use_flags = X_ALL; \
+        dyn->f = status_none;                                                               \
+    } while (0)
+
+#define READFLAGS_FUSION(A, s1, s2, s3, s4, s5)                                                                \
+    if (BOX64ENV(dynarec_nativeflags) && ninst > 0) {                                                          \
+        int prev = ninst - 1;                                                                                  \
+        while (prev && dyn->insts[prev].no_scratch_usage)                                                      \
+            prev -= 1;                                                                                         \
+        if (!dyn->insts[prev].nat_flags_nofusion) {                                                            \
+            if ((A) == (X_ZF))                                                                                 \
+                dyn->insts[ninst].nat_flags_fusion = 1;                                                        \
+            else if (dyn->insts[prev].nat_flags_carry && ((A) == (X_CF) || (A) == (X_CF | X_ZF)))              \
+                dyn->insts[ninst].nat_flags_fusion = 1;                                                        \
+            else if (dyn->insts[prev].nat_flags_sign && ((A) == (X_SF | X_OF) || (A) == (X_SF | X_OF | X_ZF))) \
+                dyn->insts[ninst].nat_flags_fusion = 1;                                                        \
+        }                                                                                                      \
+    }                                                                                                          \
+    READFLAGS(A);
+
+/* SF_SET_NODF and SF_SET_PENDING may leave the incoming deferred flags untouched. */
+#define SETFLAGS(A, B, FUSION)                                                                          \
+    do {                                                                                                \
+        dyn->insts[ninst].x64.set_flags = A;                                                            \
+        dyn->insts[ninst].x64.state_flags = (B) & ~SF_DF;                                               \
+        if (((B) & SF_SET_PENDING) != SF_SET_PENDING) {                                                 \
+            dyn->f = ((B) & SF_SET) ? (((B) == SF_SET_NODF) ? dyn->f : status_none_pending)             \
+                                    : ((dyn->f == status_none) ? status_none : status_none_pending);    \
+        }                                                                                               \
+        if (!BOX64ENV(dynarec_df)) {                                                                    \
+            dyn->f = status_none;                                                                       \
+            if ((B) == SF_PENDING) {                                                                    \
+                printf_log(LOG_INFO, "Warning, some opcode use SF_PENDING, forcing deferedflags ON\n"); \
+                SET_BOX64ENV(dynarec_df, 1);                                                            \
+            }                                                                                           \
+        }                                                                                               \
+        dyn->insts[ninst].nat_flags_nofusion = (FUSION);                                                \
+    } while (0)
+
+#define EMIT(A) dyn->native_size += 4
+#define JUMP(A, C)                                  \
+    do {                                            \
+        dyn->insts[ninst].x64.jmp = (uintptr_t)(A); \
+        add_jump(dyn, ninst);                       \
+        add_next(dyn, dyn->insts[ninst].x64.jmp);   \
+        SMEND();                                    \
+        dyn->insts[ninst].x64.jmp_cond = C;         \
+        dyn->insts[ninst].x64.jmp_insts = 0;        \
+    } while (0)
+#define BARRIER(A)                                 \
+    if (A != BARRIER_MAYBE) {                      \
+        UP32_READALL();                            \
+        fpu_purgecache(dyn, ninst, 0, x1, x2, x3); \
+        dyn->insts[ninst].x64.barrier = A;         \
+    } else                                         \
+        dyn->insts[ninst].barrier_maybe = 1
+#define SET_HASCALLRET() dyn->insts[ninst].x64.has_callret = 1
+#define NEW_INST                                                 \
+    ++dyn->size;                                                 \
+    memset(&dyn->insts[ninst], 0, sizeof(instruction_native_t)); \
+    dyn->insts[ninst].x64.addr = ip;                             \
+    dyn->e.combined1 = dyn->e.combined2 = 0;                     \
+    dyn->e.swapped = 0;                                          \
+    dyn->e.barrier = 0;                                          \
+    for (int i = 0; i < 16; ++i)                                 \
+        dyn->e.olds[i].v = 0;                                    \
+    dyn->insts[ninst].f_entry = dyn->f;                          \
+    dyn->insts[ninst].vector_sew_entry = dyn->vector_sew;        \
+    dyn->inst_sew = dyn->vector_sew;                             \
+    dyn->inst_vlmul = VECTOR_LMUL1;                              \
+    dyn->inst_vl = 0;                                            \
+    dyn->insts[ninst].x64.strongmem = ((box64_wine && VolatileRangesContains(ip)) ? 0 : BOX64DRENV(dynarec_strongmem));\
+    if (ninst)                                                   \
+        dyn->insts[ninst - 1].x64.size = dyn->insts[ninst].x64.addr - dyn->insts[ninst - 1].x64.addr;\
+    AREFLAGSNEEDED()
+
+#define INST_EPILOG                                      \
+    dyn->insts[ninst].f_exit = dyn->f;                   \
+    sse_sync_all_cache_types(&dyn->e);                   \
+    dyn->insts[ninst].e = dyn->e;                        \
+    dyn->insts[ninst].vector_sew_exit = dyn->vector_sew; \
+    dyn->insts[ninst].x64.has_next = (ok > 0) ? 1 : 0;
+#define INST_NAME(name)
+#define DEFAULT                                                                                                               \
+    --dyn->size;                                                                                                              \
+    *ok = -1;                                                                                                                 \
+    if (ninst) { dyn->insts[ninst - 1].x64.size = ip - dyn->insts[ninst - 1].x64.addr; }                                      \
+    if (BOX64ENV(dynarec_log) >= LOG_INFO || dyn->need_dump || BOX64ENV(dynarec_missing))                                     \
+        if (!dyn->size || BOX64ENV(dynarec_log) > LOG_INFO || dyn->need_dump) {                                               \
+            dynarec_stopped(dyn->insts[ninst].x64.addr, rex.is32bits);                                                        \
+        }
+
+#define SET_ELEMENT_WIDTH(s1, sew, set)                    \
+    do {                                                   \
+        if ((sew) != VECTOR_SEWANY && (set))               \
+            dyn->vector_sew = (sew);                       \
+        else if (dyn->vector_sew == VECTOR_SEWNA && (set)) \
+            dyn->vector_sew = VECTOR_SEW8;                 \
+    } while (0)
+
+// mark opcode as "unaligned" if the current address is marked as already unaligned
+#define IF_UNALIGNED(A) if ((dyn->insts[ninst].unaligned = is_addr_unaligned(A)))
+#define IF_ALIGNED(A)   if (!(dyn->insts[ninst].unaligned = is_addr_unaligned(A)))
+
+#define NATIVE_RESTORE_X87PC()
+#define X87_CHECK_PRECISION(A)                                      \
+    do {                                                            \
+        if (dyn->need_x87check) dyn->insts[ninst].x87precision = 1; \
+    } while (0)
+
+#define SCRATCH_USAGE(usage)                         \
+    do {                                             \
+        dyn->insts[ninst].no_scratch_usage = !usage; \
+    } while (0)

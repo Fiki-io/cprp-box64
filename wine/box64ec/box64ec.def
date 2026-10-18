@@ -1,0 +1,13 @@
+LIBRARY box64ec.dll
+
+EXPORTS
+  ExitToX64 DATA
+  DispatchJump DATA
+  RetToEntryThunk DATA
+  BeginSimulation DATA
+  ResetToConsistentState
+  BTCpu64IsProcessorFeaturePresent
+  ProcessInit
+  ThreadInit
+  ThreadTerm
+  UpdateProcessorInformation
